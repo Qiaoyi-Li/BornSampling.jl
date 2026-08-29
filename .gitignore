@@ -1,0 +1,9 @@
+*.jl.*.cov
+*.jl.cov
+*.jl.mem
+/Manifest*.toml
+/docs/Manifest*.toml
+/examples/**/Manifest*.toml
+/docs/build/
+/examples/Hubbard/output/
+.DS_Store
