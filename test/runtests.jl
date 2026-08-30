@@ -1,5 +1,6 @@
 using Bornsampling
 import FiniteMPS
+import FiniteMPSTangents
 using LinearAlgebra
 using Random
 using Test
@@ -21,5 +22,6 @@ include("helpers.jl")
     include("joint.jl")
     include("api.jl")
     include("batch.jl")
+    include("tangent.jl")
     include("performance.jl")
 end

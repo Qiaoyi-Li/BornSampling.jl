@@ -42,6 +42,13 @@ Constructing a sampler canonicalizes its state in place and retains compiled
 views of the local tensors. Reuse that sampler for repeated shots and treat its
 state as sampling-owned afterward.
 
+`FiniteMPSTangents.TangentMPS` uses the same `BornSampler` and `bornsample!`
+entry points. Its coherent single-insertion sum is sampled as a Hilbert-space
+state, while local MPO purification legs and a persistent tangent symmetry leg
+are traced. Constructing this sampler does not mutate the tangent or its base,
+but the compiled sampler retains tensor-block views, so treat both as
+sampling-owned afterward.
+
 ## Learn more
 
 - [Tutorial](https://Qiaoyi-Li.github.io/Bornsampling.jl/dev/tutorial/)

@@ -27,10 +27,19 @@ A rank-3 site inside an MPO contributes the synthetic purification index
 `yᵢ = 1`. This gives mixed rank-3/rank-4 MPOs one consistent configuration
 layout.
 
+For a `FiniteMPSTangents.TangentMPS`, the sampler represents the coherent sum
+of all one-site insertion terms under the tangent-space/Hilbert-space
+isomorphism. Local MPO purification legs and the persistent tangent symmetry
+leg are traced, and the configuration again contains `L` physical indices.
+The tangent and its base point are not mutated or canonicalized;
+`purified=false` is therefore unsupported for this interface. The compiled
+sampler retains views into their tensor blocks, so they must not be modified
+while it is in use.
+
 `left_boundary` accepts a pure boundary vector for a supported nontrivial left
-boundary. Sampler construction normalizes that vector, canonicalizes the state
-at site 1, compiles the local contractions, and allocates reusable worker
-workspaces.
+boundary. Sampler construction normalizes that vector, compiles the local
+contractions, and allocates reusable worker workspaces. Direct MPS/MPO inputs
+are additionally canonicalized at site 1.
 
 ## Drawing samples
 
@@ -77,15 +86,16 @@ An ordinary probability is obtained when needed with
 
 ## Direct state convenience
 
-An `MPS` or `MPO` may be passed directly:
+An `MPS`, `MPO`, or `TangentMPS` may be passed directly:
 
 ```julia
 shot = Bornsampling.bornsample!(rng, deepcopy(state))
 batch = Bornsampling.bornsample!(rng, deepcopy(state), nshots; ntasks=4)
 ```
 
-These forms construct a temporary sampler and therefore canonicalize the
-supplied state. Reusing an explicit `BornSampler` retains its compiled plans,
+These forms construct a temporary sampler. Direct MPS/MPO forms canonicalize
+the supplied state, whereas the TangentMPS form leaves the tangent and its base
+unchanged. Reusing an explicit `BornSampler` retains its compiled plans,
 prefix-ready metadata, and numerical workspaces across calls.
 
 ## Configuration basis
@@ -97,4 +107,5 @@ configurations use the same convention for each purification index.
 
 The exclamation mark records the public mutations: the core form writes
 `config`, every sampler call reuses mutable numerical workspaces, and direct
-state forms canonicalize their input state.
+MPS/MPO forms canonicalize their input state. Direct TangentMPS forms do not
+canonicalize or mutate the tangent or its base.

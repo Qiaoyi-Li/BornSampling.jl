@@ -843,7 +843,7 @@ function bornsample!(rng::Random.AbstractRNG, sampler::BornSampler)
     )
 end
 
-function _copy_active_weights(workspace::SamplingWorkspace, count::Int)
+function _copy_active_weights(workspace, count::Int)
     weights = Vector{eltype(workspace.q)}(undef, count)
     @inbounds for index in 1:count
         weights[index] = workspace.q[index]
@@ -1009,7 +1009,7 @@ end
 
 function _get_or_build_prefix_child!(
     sampler::BornSampler,
-    workspace::SamplingWorkspace,
+    workspace,
     current_cache::PrefixCache,
     next_cache::PrefixCache,
     parent::PrefixNode,
@@ -1047,7 +1047,7 @@ end
 function _draw_cached_outcome!(
     rng,
     sampler::BornSampler,
-    workspace::SamplingWorkspace,
+    workspace,
     current_cache::PrefixCache,
     current_node_ids::Vector{Int},
     configuration::Matrix{Int},
@@ -1073,7 +1073,7 @@ end
 function _advance_cached_layer_shot!(
     rng,
     sampler::BornSampler,
-    workspace::SamplingWorkspace,
+    workspace,
     current_cache::PrefixCache,
     next_cache::PrefixCache,
     current_node_ids::Vector{Int},
@@ -1108,7 +1108,7 @@ end
 function _finish_cached_layer_shot!(
     rng,
     sampler::BornSampler,
-    workspace::SamplingWorkspace,
+    workspace,
     current_cache::PrefixCache,
     current_node_ids::Vector{Int},
     configuration::Matrix{Int},

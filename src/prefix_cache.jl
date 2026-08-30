@@ -30,10 +30,11 @@ The numerical environment itself is deliberately absent. For an extendable
 MPS or joint-MPO prefix, `factor_space` reconstructs its normalized collapsed
 factor. For an extendable traced-MPO prefix, `branch_factor_spaces` reconstruct
 the complete uncompressed `G_x` bank, whose entries are moved out once their
-edges are created. A prefix immediately before the final site needs neither
-environment form nor child edges, so both space fields are `nothing` and
-`children` is empty. After publication through its parent's `ChildSlot`, every
-node field is read-only.
+edges are created. Other sampling modes may use a self-describing environment
+codec and set `extendable=true` while leaving both space fields as `nothing`.
+A prefix immediately before the final site has `extendable=false`, needs no
+environment form or child edges, and has an empty `children` vector. After
+publication through its parent's `ChildSlot`, every node field is read-only.
 """
 struct PrefixNode{R}
     id::Int
@@ -50,6 +51,7 @@ function PrefixNode(;
     q::AbstractVector{R},
     factor_space::Union{Nothing,TK.TensorMapSpace},
     branch_factor_spaces::Union{Nothing,AbstractVector}=nothing,
+    extendable::Union{Nothing,Bool}=nothing,
 ) where {R}
     spaces = branch_factor_spaces === nothing ? nothing :
              TK.TensorMapSpace[space for space in branch_factor_spaces]
@@ -58,8 +60,12 @@ function PrefixNode(;
             "branch factor space count $(length(spaces)) does not match " *
             "$(length(q)) branch weights",
         ))
-    extendable = factor_space !== nothing || spaces !== nothing
-    children = !extendable ? ChildSlot[] :
+    has_environment = factor_space !== nothing || spaces !== nothing
+    should_extend = something(extendable, has_environment)
+    !should_extend && has_environment && throw(ArgumentError(
+        "a terminal prefix cannot own a continuation environment",
+    ))
+    children = !should_extend ? ChildSlot[] :
                [ChildSlot() for _ in eachindex(q)]
     return PrefixNode{R}(
         id,
@@ -98,7 +104,7 @@ serializes construction-time dictionary writes and top-K replacement. Disk I/O
 for an evicted victim happens while that lock is held, before the resident
 dictionary is updated.
 """
-mutable struct PrefixCache{T,R,F<:TK.TensorMap{T},E}
+mutable struct PrefixCache{T,R,F,E}
     nodes::Vector{Union{Nothing,PrefixNode{R}}}
     resident::Dict{Int,E}
     maxsize::Int
