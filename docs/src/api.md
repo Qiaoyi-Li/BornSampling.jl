@@ -67,8 +67,10 @@ batch = Bornsampling.bornsample!(
 
 `batch.configuration` stores one shot per column and
 `batch.log_probability[n]` is the log probability of column `n`. `ntasks`
-chooses the number of Julia worker tasks. With `disk=true`, `maxsize` chooses
-how many prefix environments remain resident in memory.
+chooses the number of Julia worker tasks. Shots advance one site at a time and
+are dynamically assigned within each layer. With `disk=true`, `maxsize`
+chooses how many environments remain resident in each prefix frontier; the
+adjacent current and next frontiers coexist while a layer is being completed.
 
 An ordinary probability is obtained when needed with
 `exp(shot.log_probability)` or `exp.(batch.log_probability)`.

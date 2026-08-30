@@ -882,7 +882,7 @@ function _initialize_prefix_cache!(
     )
     _set_node!(cache, root)
     extendable && _insert_resident!(cache, root, factor)
-    return nothing
+    return root
 end
 
 function _initialize_prefix_cache!(
@@ -917,13 +917,14 @@ function _initialize_prefix_cache!(
         root,
         TracedBranchBundle(factors::Vector{F}),
     )
-    return nothing
+    return root
 end
 
 function _build_prefix_child!(
     sampler::BornSampler,
     workspace::SamplingWorkspace,
-    cache::PrefixCache{T,R,F,F},
+    current_cache::PrefixCache{T,R,F,F},
+    next_cache::PrefixCache{T,R,F,F},
     parent::PrefixNode,
     selected::Int,
     site::Int,
@@ -932,10 +933,10 @@ function _build_prefix_child!(
     qselected = parent.q[selected]
     z = _total_weight(parent.q, length(parent.q), site)
     child_log_probability =
-        parent.log_probability + log(qselected) - log(z)
-    child_id = _allocate_node_id!(cache)
+        parent.log_probability + (log(qselected) - log(z))
+    child_id = _allocate_node_id!(next_cache)
 
-    parent_factor = _prefix_factor(cache, parent.id)
+    parent_factor = _prefix_factor(current_cache, parent.id)
     factor = _advance_factor!(
         workspace,
         parent_factor,
@@ -955,15 +956,16 @@ function _build_prefix_child!(
         q=q,
         factor_space=extendable ? TK.space(factor) : nothing,
     )
-    _set_node!(cache, child)
-    extendable && _admit_owned_prefix_factor!(cache, child, parent.id, factor)
+    _set_node!(next_cache, child)
+    extendable && _admit_owned_prefix_factor!(next_cache, child, factor)
     return child
 end
 
 function _build_prefix_child!(
     sampler::BornSampler{TracedMPOMode},
     workspace::SamplingWorkspace{TracedMPOMode},
-    cache::PrefixCache{T,R,F,TracedBranchBundle{F}},
+    current_cache::PrefixCache{T,R,F,TracedBranchBundle{F}},
+    next_cache::PrefixCache{T,R,F,TracedBranchBundle{F}},
     parent::PrefixNode,
     selected::Int,
     site::Int,
@@ -972,10 +974,10 @@ function _build_prefix_child!(
     qselected = parent.q[selected]
     z = _total_weight(parent.q, length(parent.q), site)
     child_log_probability =
-        parent.log_probability + log(qselected) - log(z)
-    child_id = _allocate_node_id!(cache)
+        parent.log_probability + (log(qselected) - log(z))
+    child_id = _allocate_node_id!(next_cache)
 
-    G = _take_traced_branch!(cache, parent, selected)
+    G = _take_traced_branch!(current_cache, parent, selected)
     factor = _advance_built_traced_factor!(G, plan, qselected)
     next_plan = sampler.plans[site + 1]
     extendable = site + 1 < length(sampler.plans)
@@ -996,11 +998,10 @@ function _build_prefix_child!(
         branch_factor_spaces=extendable ?
             map(TK.space, factors::Vector{F}) : nothing,
     )
-    _set_node!(cache, child)
+    _set_node!(next_cache, child)
     extendable && _admit_owned_prefix_factor!(
-        cache,
+        next_cache,
         child,
-        parent.id,
         TracedBranchBundle(factors::Vector{F}),
     )
     return child
@@ -1009,14 +1010,15 @@ end
 function _get_or_build_prefix_child!(
     sampler::BornSampler,
     workspace::SamplingWorkspace,
-    cache::PrefixCache,
+    current_cache::PrefixCache,
+    next_cache::PrefixCache,
     parent::PrefixNode,
     selected::Int,
     site::Int,
 )
     slot = parent.children[selected]
     child_id = _child_id(slot)
-    iszero(child_id) || return _published_prefix_node(cache, child_id)
+    iszero(child_id) || return _published_prefix_node(next_cache, child_id)
 
     lock(slot.lock)
     try
@@ -1025,7 +1027,8 @@ function _get_or_build_prefix_child!(
             child = _build_prefix_child!(
                 sampler,
                 workspace,
-                cache,
+                current_cache,
+                next_cache,
                 parent,
                 selected,
                 site,
@@ -1035,70 +1038,194 @@ function _get_or_build_prefix_child!(
             _publish_child_id!(slot, child.id)
             return child
         end
-        return _published_prefix_node(cache, child_id)
+        return _published_prefix_node(next_cache, child_id)
     finally
         unlock(slot.lock)
     end
 end
 
-function _sample_cached_shot!(
+function _draw_cached_outcome!(
     rng,
     sampler::BornSampler,
     workspace::SamplingWorkspace,
-    cache::PrefixCache,
+    current_cache::PrefixCache,
+    current_node_ids::Vector{Int},
     configuration::Matrix{Int},
     shot::Int,
+    site::Int,
 )
-    node = _published_prefix_node(cache, 1)
+    node = _published_prefix_node(current_cache, current_node_ids[shot])
     chain_length = length(sampler.plans)
-    @inbounds for site in eachindex(sampler.plans)
-        z = _total_weight(node.q, length(node.q), site)
-        selected = _draw_outcome(rng, node.q, z, length(node.q))
-        _store_outcome!(
-            workspace,
-            configuration,
-            site,
-            chain_length,
-            shot,
-            sampler.plans[site],
-            selected,
-        )
-        qselected = node.q[selected]
-        if site == length(sampler.plans)
-            return node.log_probability + log(qselected) - log(z)
+    z = _total_weight(node.q, length(node.q), site)
+    selected = _draw_outcome(rng, node.q, z, length(node.q))
+    _store_outcome!(
+        workspace,
+        configuration,
+        site,
+        chain_length,
+        shot,
+        sampler.plans[site],
+        selected,
+    )
+    return node, selected, z
+end
+
+function _advance_cached_layer_shot!(
+    rng,
+    sampler::BornSampler,
+    workspace::SamplingWorkspace,
+    current_cache::PrefixCache,
+    next_cache::PrefixCache,
+    current_node_ids::Vector{Int},
+    next_node_ids::Vector{Int},
+    configuration::Matrix{Int},
+    shot::Int,
+    site::Int,
+)
+    node, selected, _ = _draw_cached_outcome!(
+        rng,
+        sampler,
+        workspace,
+        current_cache,
+        current_node_ids,
+        configuration,
+        shot,
+        site,
+    )
+    child = _get_or_build_prefix_child!(
+        sampler,
+        workspace,
+        current_cache,
+        next_cache,
+        node,
+        selected,
+        site,
+    )
+    @inbounds next_node_ids[shot] = child.id
+    return nothing
+end
+
+function _finish_cached_layer_shot!(
+    rng,
+    sampler::BornSampler,
+    workspace::SamplingWorkspace,
+    current_cache::PrefixCache,
+    current_node_ids::Vector{Int},
+    configuration::Matrix{Int},
+    log_probability,
+    shot::Int,
+    site::Int,
+)
+    node, selected, z = _draw_cached_outcome!(
+        rng,
+        sampler,
+        workspace,
+        current_cache,
+        current_node_ids,
+        configuration,
+        shot,
+        site,
+    )
+    @inbounds log_probability[shot] =
+        node.log_probability + (log(node.q[selected]) - log(z))
+    return nothing
+end
+
+function _advance_cached_layer!(
+    shot_rngs,
+    sampler::BornSampler,
+    current_cache::PrefixCache,
+    next_cache::PrefixCache,
+    current_node_ids::Vector{Int},
+    next_node_ids::Vector{Int},
+    configuration::Matrix{Int},
+    site::Int,
+    nshots::Int,
+    worker_count::Int,
+)
+    next_shot = Threads.Atomic{Int}(1)
+    Threads.@sync for worker_id in 1:worker_count
+        Threads.@spawn begin
+            workspace = sampler.workspaces[worker_id]
+            while true
+                shot = Threads.atomic_add!(next_shot, 1)
+                shot > nshots && break
+                _advance_cached_layer_shot!(
+                    shot_rngs[shot],
+                    sampler,
+                    workspace,
+                    current_cache,
+                    next_cache,
+                    current_node_ids,
+                    next_node_ids,
+                    configuration,
+                    shot,
+                    site,
+                )
+            end
         end
-        node = _get_or_build_prefix_child!(
-            sampler,
-            workspace,
-            cache,
-            node,
-            selected,
-            site,
-        )
     end
-    return node.log_probability
+    return nothing
+end
+
+function _finish_cached_layer!(
+    shot_rngs,
+    sampler::BornSampler,
+    current_cache::PrefixCache,
+    current_node_ids::Vector{Int},
+    configuration::Matrix{Int},
+    log_probability,
+    site::Int,
+    nshots::Int,
+    worker_count::Int,
+)
+    next_shot = Threads.Atomic{Int}(1)
+    Threads.@sync for worker_id in 1:worker_count
+        Threads.@spawn begin
+            workspace = sampler.workspaces[worker_id]
+            while true
+                shot = Threads.atomic_add!(next_shot, 1)
+                shot > nshots && break
+                _finish_cached_layer_shot!(
+                    shot_rngs[shot],
+                    sampler,
+                    workspace,
+                    current_cache,
+                    current_node_ids,
+                    configuration,
+                    log_probability,
+                    shot,
+                    site,
+                )
+            end
+        end
+    end
+    return nothing
 end
 
 """
     bornsample!(rng, sampler::BornSampler, nshots::Int;
                 ntasks=Threads.nthreads(), disk=false, maxsize=ntasks)
 
-Draw a batch of samples using a batch-local sampled-prefix tree. Every worker
-task owns an independent contraction workspace and per-shot RNG. `ntasks` is
-not capped by the number of Julia threads; Julia's scheduler multiplexes the
-requested tasks. The caller must not invoke another sampling method on the same
-sampler concurrently.
+Draw a batch of samples using layer-synchronous sampled-prefix frontiers. Within
+each site, worker tasks dynamically claim shots and independently advance them.
+A layer barrier then releases the preceding frontier before the next site
+starts. Every worker owns an independent contraction workspace, while every
+shot retains its own RNG across layers. `ntasks` is not capped by the number of
+Julia threads; Julia's scheduler multiplexes the requested tasks. The caller
+must not invoke another sampling method on the same sampler concurrently.
 
 For an `MPS` or an `MPO` in the default mode, the returned configuration matrix
 has shape `(length(state), nshots)`, with one physical configuration per
 column. For an `MPO` compiled with `purified=false`, it has shape
 `(2 * length(state), nshots)`: the first `L` rows are physical indices and the
 final `L` rows are purification indices. When `disk=true`, metadata stays in
-memory while larger node environments are managed by a strict probability
-top-`maxsize` resident cache and raw temporary files. An MPS or joint-MPO node
-stores one normalized collapsed factor. A traced-MPO node instead stores the
-complete bank of uncompressed next-physical-outcome factors; an outcome is
-moved out of that bank and compressed only when its child edge is first used.
+memory while larger node environments in each frontier are managed by a strict
+probability top-`maxsize` resident cache and raw temporary files. An MPS or
+joint-MPO node stores one normalized collapsed factor. A traced-MPO node instead
+stores the complete bank of uncompressed next-physical-outcome factors; an
+outcome is moved out of that bank and compressed only when its child edge is
+first used.
 """
 function bornsample!(
     rng::Random.AbstractRNG,
@@ -1133,46 +1260,75 @@ function bornsample!(
     worker_count = min(nshots, ntasks)
     _ensure_workspaces!(sampler, worker_count)
 
-    # Only this task touches the caller's RNG. A fixed seed per shot makes the
-    # result independent of worker scheduling and the requested task count.
-    seeds = Vector{UInt64}(undef, nshots)
+    # Only this task touches the caller's RNG. Each shot retains a seeded RNG
+    # across layers, making the result independent of worker scheduling and the
+    # requested task count.
+    shot_rngs = Vector{Random.Xoshiro}(undef, nshots)
     @inbounds for shot in 1:nshots
-        seeds[shot] = rand(rng, UInt64)
+        shot_rngs[shot] = Random.Xoshiro(rand(rng, UInt64))
     end
 
     Environment = _prefix_environment_type(sampler, Factor)
-    cache = _new_prefix_cache(
+    current_cache = _new_prefix_cache(
         Environment,
         Factor,
         Rprob,
-        nshots,
-        chain_length;
-        disk=disk,
+        1;
+        disk=disk && chain_length > 1,
         maxsize=maxsize,
     )
-    next_shot = Threads.Atomic{Int}(1)
+    next_cache = nothing
     try
-        _initialize_prefix_cache!(sampler, first(sampler.workspaces), cache)
-        Threads.@sync for worker_id in 1:worker_count
-            Threads.@spawn begin
-                workspace = sampler.workspaces[worker_id]
-                while true
-                    shot = Threads.atomic_add!(next_shot, 1)
-                    shot > nshots && break
-                    shot_rng = Random.Xoshiro(seeds[shot])
-                    log_probability[shot] = _sample_cached_shot!(
-                        shot_rng,
-                        sampler,
-                        workspace,
-                        cache,
-                        configuration,
-                        shot,
-                    )
-                end
-            end
+        root = _initialize_prefix_cache!(
+            sampler,
+            first(sampler.workspaces),
+            current_cache,
+        )
+        current_node_ids = fill(root.id, nshots)
+        next_node_ids = Vector{Int}(undef, nshots)
+
+        for site in 1:(chain_length - 1)
+            next_cache = _new_prefix_cache(
+                Environment,
+                Factor,
+                Rprob,
+                nshots;
+                disk=disk && site + 1 < chain_length,
+                maxsize=maxsize,
+            )
+            _advance_cached_layer!(
+                shot_rngs,
+                sampler,
+                current_cache,
+                next_cache,
+                current_node_ids,
+                next_node_ids,
+                configuration,
+                site,
+                nshots,
+                worker_count,
+            )
+
+            _cleanup_prefix_cache!(current_cache)
+            current_cache = next_cache
+            next_cache = nothing
+            current_node_ids, next_node_ids = next_node_ids, current_node_ids
         end
+
+        _finish_cached_layer!(
+            shot_rngs,
+            sampler,
+            current_cache,
+            current_node_ids,
+            configuration,
+            log_probability,
+            chain_length,
+            nshots,
+            worker_count,
+        )
     finally
-        _cleanup_prefix_cache!(cache)
+        next_cache === nothing || _cleanup_prefix_cache!(next_cache)
+        _cleanup_prefix_cache!(current_cache)
     end
 
     return (

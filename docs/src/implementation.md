@@ -255,21 +255,28 @@ through Frobenius norms and ``CC^\dagger``.  Rank-three and rank-four methods
 supply the corresponding reduced and fusion-kernel slices, while the site
 loop and probability calculation remain shared.
 
-## Batched prefix-tree reuse
+## Layer-synchronous prefix reuse
 
-A batched call builds a tree of sampled prefixes. A node stores its prefix log
-probability, next-site branch weights, child slots, and TensorMap space
-metadata for its numerical environment. MPS and joint-MPO nodes own one
-normalized rank-one factor. Traced-MPO nodes own the complete uncompressed
-``G_x`` bank produced by their weight pass. When two shots reach the same
-prefix, they reuse the branch weights and the corresponding environment
-payload. The requested shot count bounds the tree by
-``1+N\max(L-1,0)`` nodes.
+A batched call advances every shot one site per layer. The current frontier
+stores the sampled prefixes entering that site; a separate next frontier
+receives the children selected there. Each node carries its prefix log
+probability, next-site branch weights, child slots, and TensorMap space metadata
+for its numerical environment. MPS and joint-MPO nodes own one normalized
+rank-one factor. Traced-MPO nodes own the complete uncompressed ``G_x`` bank
+produced by their weight pass. Shots that reach the same prefix reuse its branch
+weights and environment payload.
 
-Workers receive independent numerical workspaces and per-shot RNGs.  Shot
-seeds are drawn from the caller's RNG before tasks start, making results stable
-under task scheduling.  `ntasks` controls the number of Julia tasks up to the
-number of shots; Julia schedules those tasks over the available threads.
+Within a layer, a shared atomic counter dynamically assigns shots to workers.
+Every worker has an independent numerical workspace, and every shot retains its
+own seeded RNG across layers. The seed sequence is drawn from the caller's RNG
+before work starts, so scheduling does not change the sampled result. `ntasks`
+controls the number of Julia tasks up to the number of shots; Julia schedules
+those tasks over the available threads.
+
+After all shots finish a layer, the barrier makes the next frontier complete.
+The preceding frontier's metadata, environments, and temporary files are then
+released before the next site starts. A frontier contains at most ``N`` nodes;
+during a transition only the adjacent current and next frontiers coexist.
 
 Parallel publication uses narrow locks:
 
@@ -280,38 +287,31 @@ Parallel publication uses narrow locks:
 - each worker writes its own output column and uses its own contraction
   workspace.
 
-This synchronization belongs to one batched `bornsample!` invocation.  The
+This synchronization belongs to one batched `bornsample!` invocation. The
 sampler's public concurrency contract leaves coordination between simultaneous
 external invocations to the caller.
 
 ## Probability-ranked environment storage
 
-Prefix metadata and branch weights remain resident for the whole batch. The
-larger numerical environments are managed separately. With disk storage
-enabled, `maxsize` node environments form a probability-ranked resident set:
-one normalized factor for an MPS or joint-MPO node, or one complete branch bank
-for a traced-MPO node. The batch's temporary directory holds the other node
-environments as raw TensorMap records.
+Prefix metadata and branch weights stay in memory for their frontier. Larger
+numerical environments are managed separately. With disk storage enabled,
+every frontier maintains its own probability-ranked set of at most `maxsize`
+resident environments: one normalized factor for an MPS or joint-MPO node, or
+one complete branch bank for a traced-MPO node. Other environments in that
+frontier are stored as raw TensorMap records.
 
-A new node environment enters the resident set only when its prefix
-probability is strictly greater than the current minimum. Once the resident
-set is full, that minimum is monotone nondecreasing. Moreover,
+A new environment enters its frontier's resident set only when its prefix
+probability is strictly greater than the current minimum; exact ties stay on
+disk. Because the next frontier is ranked independently, its final resident set
+is the exact top-`maxsize` subset at that depth. While a layer transition is in
+progress, the adjacent frontiers can together hold up to ``2\,\texttt{maxsize}``
+resident environments. After the barrier releases the preceding frontier, the
+active set is again bounded by `maxsize`.
 
-```math
-p(\text{child prefix})
-=p(\text{parent prefix})p(a_i\mid\text{parent})
-\le p(\text{parent prefix}).
-```
-
-Therefore descendants of a cold parent go directly to disk, and a loaded cold
-environment retains its cold classification. This keeps admission work
-proportional to newly competitive prefixes.
-
-The cache publishes each raw TensorMap record through a temporary file followed
-by an atomic rename. Immutable space metadata in the node reconstructs a
-rank-one factor or every available member of a traced branch bank. Dictionary
-access uses a short resident lock, while a separate admission lock serializes
-top-set replacement. An environment selected for eviction remains readable in
-memory through publication of its complete disk representation; the resident
-dictionary then advances to the new top set. The batch owns the temporary
-directory for its full lifetime.
+The source frontier's metadata and resident dictionary remain fixed while its
+environments are read or consumed and the destination frontier is constructed.
+An admission lock serializes destination dictionary updates and top-set
+replacement. Each raw TensorMap record is published through a temporary file
+followed by an atomic rename, and immutable space metadata reconstructs a
+rank-one factor or a traced branch-bank member. Removing the source frontier at
+the layer boundary also removes its temporary directory.

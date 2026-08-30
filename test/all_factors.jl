@@ -47,22 +47,28 @@
             sampler.plans[1] = counted_plan
 
             Environment = BS._prefix_environment_type(sampler, typeof(factor))
-            cache = BS._new_prefix_cache(
+            source_cache = BS._new_prefix_cache(
                 Environment,
                 typeof(factor),
                 eltype(workspace.q),
-                8,
-                length(sampler.state);
+                1;
                 disk=disk,
                 maxsize=1,
             )
+            target_cache = BS._new_prefix_cache(
+                Environment,
+                typeof(factor),
+                eltype(workspace.q),
+                8;
+                disk=false,
+                maxsize=1,
+            )
             try
-                BS._initialize_prefix_cache!(sampler, workspace, cache)
-                root = BS._published_prefix_node(cache, 1)
+                root = BS._initialize_prefix_cache!(sampler, workspace, source_cache)
                 expected_views = all_branch_transition_count(counted_plan, factor)
                 @test reduced_views[] == expected_views
 
-                bundle = cache.resident[root.id]
+                bundle = source_cache.resident[root.id]
                 @test bundle isa BS.TracedBranchBundle{typeof(factor)}
                 for selected in eachindex(root.q)
                     stored = bundle.factors[selected]
@@ -105,7 +111,8 @@
                     child = BS._get_or_build_prefix_child!(
                         sampler,
                         workspace,
-                        cache,
+                        source_cache,
+                        target_cache,
                         root,
                         selected,
                         1,
@@ -121,7 +128,8 @@
                     same_child = BS._get_or_build_prefix_child!(
                         sampler,
                         workspace,
-                        cache,
+                        source_cache,
+                        target_cache,
                         root,
                         selected,
                         1,
@@ -130,7 +138,8 @@
                     @test reduced_views[] == expected_views
                 end
             finally
-                BS._cleanup_prefix_cache!(cache)
+                BS._cleanup_prefix_cache!(target_cache)
+                BS._cleanup_prefix_cache!(source_cache)
             end
         end
     end
@@ -147,18 +156,24 @@
         sampler.plans[1] = counted_plan
 
         Environment = BS._prefix_environment_type(sampler, typeof(factor))
-        cache = BS._new_prefix_cache(
+        source_cache = BS._new_prefix_cache(
             Environment,
             typeof(factor),
             eltype(workspace.q),
-            contenders,
-            length(sampler.state);
+            1;
+            disk=false,
+            maxsize=contenders,
+        )
+        target_cache = BS._new_prefix_cache(
+            Environment,
+            typeof(factor),
+            eltype(workspace.q),
+            contenders;
             disk=false,
             maxsize=contenders,
         )
         try
-            BS._initialize_prefix_cache!(sampler, workspace, cache)
-            root = BS._published_prefix_node(cache, 1)
+            root = BS._initialize_prefix_cache!(sampler, workspace, source_cache)
             selected = argmax(root.q)
             expected_views = all_branch_transition_count(counted_plan, factor)
             child_ids = Vector{Int}(undef, contenders)
@@ -167,7 +182,8 @@
                     child_ids[worker] = BS._get_or_build_prefix_child!(
                         sampler,
                         sampler.workspaces[worker],
-                        cache,
+                        source_cache,
+                        target_cache,
                         root,
                         selected,
                         1,
@@ -175,11 +191,12 @@
                 end
             end
             @test all(==(first(child_ids)), child_ids)
-            @test cache.next_node_id[] == 2
+            @test target_cache.next_node_id[] == 1
             @test reduced_views[] == expected_views
-            @test cache.resident[root.id].factors[selected] === nothing
+            @test source_cache.resident[root.id].factors[selected] === nothing
         finally
-            BS._cleanup_prefix_cache!(cache)
+            BS._cleanup_prefix_cache!(target_cache)
+            BS._cleanup_prefix_cache!(source_cache)
         end
     end
 
@@ -189,30 +206,60 @@
         factor = sampler.initial_factor
         Factor = typeof(factor)
         Environment = BS._prefix_environment_type(sampler, Factor)
-        cache = BS._new_prefix_cache(
+        source_cache = BS._new_prefix_cache(
             Environment,
             Factor,
             eltype(workspace.q),
-            8,
-            length(sampler.state);
+            1;
             disk=true,
             maxsize=1,
         )
-        directory = cache.directory::String
+        target_cache = BS._new_prefix_cache(
+            Environment,
+            Factor,
+            eltype(workspace.q),
+            8;
+            disk=true,
+            maxsize=1,
+        )
+        source_directory = source_cache.directory::String
+        target_directory = target_cache.directory::String
         try
-            BS._initialize_prefix_cache!(sampler, workspace, cache)
-            root = BS._published_prefix_node(cache, 1)
-            selected_root = argmax(root.q)
-            child = BS._get_or_build_prefix_child!(
-                sampler,
-                workspace,
-                cache,
-                root,
-                selected_root,
-                1,
+            root = BS._initialize_prefix_cache!(sampler, workspace, source_cache)
+            positive_root = findall(>(zero(eltype(root.q))), root.q)
+            @test length(positive_root) >= 2
+            children = Dict{Int,typeof(root)}()
+            for selected_root in positive_root[1:2]
+                children[selected_root] = BS._get_or_build_prefix_child!(
+                    sampler,
+                    workspace,
+                    source_cache,
+                    target_cache,
+                    root,
+                    selected_root,
+                    1,
+                )
+            end
+            @test length(target_cache.resident) == 1
+            cold_selections = filter(
+                selected -> !haskey(
+                    target_cache.resident,
+                    children[selected].id,
+                ),
+                positive_root[1:2],
             )
-            @test !child.logical_resident[]
+            @test length(cold_selections) == 1
+            selected_root = only(cold_selections)
+            child = children[selected_root]
             @test child.branch_factor_spaces !== nothing
+
+            # Once the layer barrier retires the source frontier, its metadata,
+            # environments, and directory disappear while the target survives.
+            BS._cleanup_prefix_cache!(source_cache)
+            @test isempty(source_cache.resident)
+            @test all(isnothing, source_cache.nodes)
+            @test !ispath(source_directory)
+            @test isdir(target_directory)
 
             reference_workspace = BS._clone_workspace(workspace)
             reference_factor = advance_test_factor!(
@@ -225,9 +272,9 @@
             positive = findall(>(zero(eltype(child.q))), child.q)
             @test length(positive) >= 2
             for selected in positive[1:2]
-                path = BS._branch_factor_path(cache, child.id, selected)
+                path = BS._branch_factor_path(target_cache, child.id, selected)
                 @test ispath(path)
-                stored = BS._take_traced_branch!(cache, child, selected)
+                stored = BS._take_traced_branch!(target_cache, child, selected)
                 @test !ispath(path)
                 reference = BS._build_selected_factor!(
                     reference_workspace,
@@ -240,8 +287,10 @@
                 @test norm(stored)^2 ≈ child.q[selected] rtol=1e-12 atol=1e-12
             end
         finally
-            BS._cleanup_prefix_cache!(cache)
+            BS._cleanup_prefix_cache!(target_cache)
+            BS._cleanup_prefix_cache!(source_cache)
         end
-        @test !ispath(directory)
+        @test !ispath(source_directory)
+        @test !ispath(target_directory)
     end
 end
