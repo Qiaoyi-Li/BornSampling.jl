@@ -66,12 +66,12 @@ and its elementwise standard-error estimate.
 
 ## Purification sampling mode
 
-The thermal script constructs `Bornsampling.BornSampler(factor)` with the
+The thermal script constructs `BornSampling.BornSampler(factor)` with the
 default `purified=true`. This draws physical configurations from the exact
 marginal obtained by tracing the MPO purification index.
 
 For joint physical--purification snapshots, construct
-`Bornsampling.BornSampler(factor; purified=false)`. The resulting configuration
+`BornSampling.BornSampler(factor; purified=false)`. The resulting configuration
 matrix places the physical rows first and the purification rows second:
 
 ```text

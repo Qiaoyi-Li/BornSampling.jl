@@ -1,11 +1,11 @@
-import Bornsampling
-using Bornsampling.FiniteMPS
-using Bornsampling.Random
+import BornSampling
+using BornSampling.FiniteMPS
+using BornSampling.Random
 using CairoMakie
 using FiniteLattices
 using Statistics
 
-const TK = Bornsampling.TK
+const TK = BornSampling.TK
 
 # Model and DMRG parameters.
 const L = 8
@@ -291,10 +291,10 @@ function main()
     # state in place while memory holds one D=1024 state.
     local sampler
     sampler_compilation_seconds =
-        @elapsed sampler = Bornsampling.BornSampler(state)
+        @elapsed sampler = BornSampling.BornSampler(state)
     local configurations
     sampling_seconds = @elapsed begin
-        configurations = Bornsampling.bornsample!(
+        configurations = BornSampling.bornsample!(
             MersenneTwister(RANDOM_SEED),
             sampler,
             Ns;

@@ -1,7 +1,9 @@
-# Bornsampling
+# BornSampling
 
-[![Stable documentation](https://img.shields.io/badge/docs-stable-blue.svg)](https://Qiaoyi-Li.github.io/Bornsampling.jl/stable/)
-[![Development documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://Qiaoyi-Li.github.io/Bornsampling.jl/dev/)
+[![Stable documentation](https://img.shields.io/badge/docs-stable-blue.svg)](https://Qiaoyi-Li.github.io/BornSampling.jl/stable/)
+[![Development documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://Qiaoyi-Li.github.io/BornSampling.jl/dev/)
+[![CI](https://github.com/Qiaoyi-Li/BornSampling.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/Qiaoyi-Li/BornSampling.jl/actions/workflows/CI.yml)
+[![codecov](https://codecov.io/gh/Qiaoyi-Li/BornSampling.jl/graph/badge.svg?branch=main)](https://codecov.io/gh/Qiaoyi-Li/BornSampling.jl)
 
 This repository is a downstream package of
 [`FiniteMPS.jl`](https://github.com/Qiaoyi-Li/FiniteMPS.jl) for
@@ -13,24 +15,25 @@ probabilities for subsequent statistical analysis.
 From the Julia package prompt:
 
 ```julia-repl
-pkg> add Bornsampling
+pkg> add BornSampling
 ```
 
 ## Quick start
 
 ```julia
-import Bornsampling
-using Bornsampling.FiniteMPS
-using Bornsampling.Random
+import BornSampling
+using BornSampling.FiniteMPS: randMPS, ℂ
+using BornSampling.Random: MersenneTwister, seed!
 
+seed!(1234)
+state = randMPS(4, ℂ^2, ℂ^1)
 rng = MersenneTwister(1234)
-state_for_sampling = deepcopy(state)
-sampler = Bornsampling.BornSampler(state_for_sampling)
+sampler = BornSampling.BornSampler(state)
 
-config = Vector{Int}(undef, length(state_for_sampling))
-logp = Bornsampling.bornsample!(rng, sampler, config)
+config = Vector{Int}(undef, length(state))
+logp = BornSampling.bornsample!(rng, sampler, config)
 
-batch = Bornsampling.bornsample!(
+batch = BornSampling.bornsample!(
     rng,
     sampler,
     1000;
@@ -44,7 +47,7 @@ state as sampling-owned afterward.
 
 ## Learn more
 
-- [Tutorial](https://Qiaoyi-Li.github.io/Bornsampling.jl/dev/tutorial/)
-- [Implementation](https://Qiaoyi-Li.github.io/Bornsampling.jl/dev/implementation/)
-- [API](https://Qiaoyi-Li.github.io/Bornsampling.jl/dev/api/)
+- [Tutorial](https://Qiaoyi-Li.github.io/BornSampling.jl/dev/tutorial/)
+- [Implementation](https://Qiaoyi-Li.github.io/BornSampling.jl/dev/implementation/)
+- [API](https://Qiaoyi-Li.github.io/BornSampling.jl/dev/api/)
 - [Full Hubbard examples](examples/Hubbard/README.md)

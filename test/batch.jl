@@ -126,7 +126,7 @@
         )
 
         directories_before = Set(filter(
-            path -> startswith(basename(path), "Bornsampling-prefix-"),
+            path -> startswith(basename(path), "BornSampling-prefix-"),
             readdir(tempdir(); join=true),
         ))
         disk = BS.bornsample!(
@@ -142,7 +142,7 @@
             maxsize=1,
         )
         directories_after = Set(filter(
-            path -> startswith(basename(path), "Bornsampling-prefix-"),
+            path -> startswith(basename(path), "BornSampling-prefix-"),
             readdir(tempdir(); join=true),
         ))
 

@@ -1,4 +1,4 @@
-module Bornsampling
+module BornSampling
 
 import FiniteMPS
 using LinearAlgebra

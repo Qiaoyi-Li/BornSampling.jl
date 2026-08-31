@@ -1,17 +1,17 @@
-using Bornsampling
+using BornSampling
 import FiniteMPS
 using LinearAlgebra
 using Random
 using Test
 
 const TK = FiniteMPS.TensorKit
-const BS = Bornsampling
+const BS = BornSampling
 
 Random.seed!(0x5eed)
 
 include("helpers.jl")
 
-@testset "Bornsampling.jl" begin
+@testset "BornSampling.jl" begin
     include("contraction.jl")
     include("residual.jl")
     include("localspaces.jl")

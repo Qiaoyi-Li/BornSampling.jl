@@ -12,21 +12,21 @@ demonstrate the workflow and do not guarantee bond-dimension or sweep
 convergence.
 
 ```@setup HubbardTutorial
-import Bornsampling
+import BornSampling
 using CairoMakie
 using Statistics
 
-const FiniteMPS = Bornsampling.FiniteMPS
-const TK = Bornsampling.TK
-const Random = Bornsampling.Random
+const FiniteMPS = BornSampling.FiniteMPS
+const TK = BornSampling.TK
+const Random = BornSampling.Random
 
 include(joinpath(
-    dirname(dirname(pathof(Bornsampling))),
+    dirname(dirname(pathof(BornSampling))),
     "docs",
     "src",
     "tutorial_helpers.jl",
 ))
-using .BornsamplingTutorialHelpers
+using .BornSamplingTutorialHelpers
 ```
 
 ## [Shared Hubbard setup](@id tutorial_setup)
@@ -40,8 +40,8 @@ H = -\sum_{\langle i,j\rangle,\sigma}
 ```
 
 The charge U(1) and spin SU(2) representation comes from
-`Bornsampling.FiniteMPS`; reduced TensorKit spaces are available through
-`Bornsampling.TK`. Model construction, state preparation, direct contraction,
+`BornSampling.FiniteMPS`; reduced TensorKit spaces are available through
+`BornSampling.TK`. Model construction, state preparation, direct contraction,
 and plotting live in `tutorial_helpers.jl`, leaving the sampling path visible
 here.
 
@@ -79,15 +79,15 @@ ground_state, ground_result = prepare_ground_state(
 ground_result
 ```
 
-`Bornsampling.BornSampler` compiles the canonical-basis contraction plans.
+`BornSampling.BornSampler` compiles the canonical-basis contraction plans.
 The batched call returns one configuration per matrix column together with its
 log probability.
 
 ```@example HubbardTutorial
 ground_direct = direct_szsz_by_distance(ground_state; ntasks)
 
-ground_sampler = Bornsampling.BornSampler(ground_state)
-ground_batch = Bornsampling.bornsample!(
+ground_sampler = BornSampling.BornSampler(ground_state)
+ground_batch = BornSampling.bornsample!(
     Random.MersenneTwister(3102),
     ground_sampler,
     Ns_rankone;
@@ -159,14 +159,14 @@ prefix-bank memory for less parallel work and prefix reuse per call.
 thermal_direct = direct_szsz_by_distance(factor; ntasks)
 
 traced_state = deepcopy(factor)
-traced_sampler = Bornsampling.BornSampler(traced_state; purified=true)
+traced_sampler = BornSampling.BornSampler(traced_state; purified=true)
 traced_rng = Random.MersenneTwister(3201)
 traced_configuration = Matrix{Int}(undef, L, Ns_traced)
 traced_batch_size = Ns_traced ÷ traced_batch_count
 
 for batch in 1:traced_batch_count
     columns = ((batch - 1) * traced_batch_size + 1):(batch * traced_batch_size)
-    result = Bornsampling.bornsample!(
+    result = BornSampling.bornsample!(
         traced_rng,
         traced_sampler,
         traced_batch_size;
@@ -193,8 +193,8 @@ Joint sampling returns a ``2L\times N_s`` configuration matrix ordered as
 observable estimator.
 
 ```@example HubbardTutorial
-joint_sampler = Bornsampling.BornSampler(factor; purified=false)
-joint_batch = Bornsampling.bornsample!(
+joint_sampler = BornSampling.BornSampler(factor; purified=false)
+joint_batch = BornSampling.bornsample!(
     Random.MersenneTwister(3202),
     joint_sampler,
     Ns_rankone;
