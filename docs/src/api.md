@@ -1,10 +1,10 @@
 # [Public API](@id public_api)
 
 ```@meta
-CurrentModule = Bornsampling
+CurrentModule = BornSampling
 ```
 
-Bornsampling exports [`BornSampler`](@ref) and [`bornsample!`](@ref).
+BornSampling exports [`BornSampler`](@ref) and [`bornsample!`](@ref).
 
 ## Constructing a sampler
 
@@ -59,20 +59,20 @@ The allocation-conscious single-shot form writes into a caller-owned vector:
 
 ```julia
 config = Vector{Int}(undef, length(state))
-logp = Bornsampling.bornsample!(rng, sampler, config)
+logp = BornSampling.bornsample!(rng, sampler, config)
 ```
 
 The allocating convenience form returns a named tuple:
 
 ```julia
-shot = Bornsampling.bornsample!(rng, sampler)
+shot = BornSampling.bornsample!(rng, sampler)
 # (configuration = ..., log_probability = ...)
 ```
 
 For batched sampling:
 
 ```julia
-batch = Bornsampling.bornsample!(
+batch = BornSampling.bornsample!(
     rng,
     sampler,
     nshots;
@@ -102,8 +102,8 @@ An ordinary probability is obtained when needed with
 An `MPS`, `MPO`, or `TangentMPS` may be passed directly:
 
 ```julia
-shot = Bornsampling.bornsample!(rng, deepcopy(state))
-batch = Bornsampling.bornsample!(rng, deepcopy(state), nshots; ntasks=4)
+shot = BornSampling.bornsample!(rng, deepcopy(state))
+batch = BornSampling.bornsample!(rng, deepcopy(state), nshots; ntasks=4)
 ```
 
 These forms construct a temporary sampler. Direct MPS/MPO forms canonicalize
@@ -114,7 +114,7 @@ prefix-ready metadata, and numerical workspaces across calls.
 ## Configuration basis
 
 Every physical index is a one-based flat index in the corresponding
-`Bornsampling.TK` physical-space canonical basis. Within a sector, the irrep
+`BornSampling.TK` physical-space canonical basis. Within a sector, the irrep
 index changes fastest and the degeneracy index changes next. Joint MPO
 configurations use the same convention for each purification index.
 

@@ -1,10 +1,8 @@
-# Bornsampling.jl
+# BornSampling.jl
 
 ```@meta
-CurrentModule = Bornsampling
+CurrentModule = BornSampling
 ```
-
-This documentation was generated with AI assistance and is provided for reference only.
 
 This repository is a downstream package of
 [`FiniteMPS.jl`](https://github.com/Qiaoyi-Li/FiniteMPS.jl) for drawing
@@ -14,22 +12,25 @@ subsequent statistical analysis.
 
 ## First sample
 
-```julia
-import Bornsampling
-using Bornsampling.FiniteMPS
-using Bornsampling.Random
+```@example first_sample
+import BornSampling
+using BornSampling.FiniteMPS: randMPS, ℂ
+using BornSampling.Random: MersenneTwister, seed!
 
-state_for_sampling = deepcopy(state)
-sampler = Bornsampling.BornSampler(state_for_sampling)
+seed!(1234)
+state = randMPS(4, ℂ^2, ℂ^1)
+sampler = BornSampling.BornSampler(state)
 
 rng = MersenneTwister(1234)
-shot = Bornsampling.bornsample!(rng, sampler)
+shot = BornSampling.bornsample!(rng, sampler)
 
-shot.configuration
-shot.log_probability
+(
+    configuration = shot.configuration,
+    log_probability = shot.log_probability,
+)
 ```
 
-Sampler construction canonicalizes `state_for_sampling` in place. The
+Sampler construction canonicalizes `state` in place. The
 compiled sampler then owns that canonicalized tensor data and can be reused for
 many shots.
 

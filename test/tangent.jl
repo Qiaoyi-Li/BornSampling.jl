@@ -181,10 +181,10 @@ end
                 ntasks=Threads.nthreads() + 3,
             )
             completion_directories = tangent_temporary_directories(
-                "Bornsampling-tangent-completion-",
+                "BornSampling-tangent-completion-",
             )
             prefix_directories = tangent_temporary_directories(
-                "Bornsampling-tangent-prefix-",
+                "BornSampling-tangent-prefix-",
             )
             disk_result = BS.bornsample!(
                 MersenneTwister(0x7162_6174),
@@ -195,10 +195,10 @@ end
                 maxsize=1,
             )
             @test tangent_temporary_directories(
-                "Bornsampling-tangent-completion-",
+                "BornSampling-tangent-completion-",
             ) == completion_directories
             @test tangent_temporary_directories(
-                "Bornsampling-tangent-prefix-",
+                "BornSampling-tangent-prefix-",
             ) == prefix_directories
             @test parallel == serial
             @test disk_result == serial

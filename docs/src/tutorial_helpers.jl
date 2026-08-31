@@ -1,12 +1,12 @@
-module BornsamplingTutorialHelpers
+module BornSamplingTutorialHelpers
 
-import Bornsampling
-using Bornsampling.FiniteMPS
-using Bornsampling.Random
+import BornSampling
+using BornSampling.FiniteMPS
+using BornSampling.Random
 using CairoMakie
 using Statistics
 
-const TK = Bornsampling.TK
+const TK = BornSampling.TK
 
 export direct_szsz_by_distance
 export hubbard_hamiltonian

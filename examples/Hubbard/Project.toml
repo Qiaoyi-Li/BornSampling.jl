@@ -1,14 +1,14 @@
 [deps]
-Bornsampling = "024a6725-e534-4d5f-9c4f-99bb86a2a22e"
+BornSampling = "024a6725-e534-4d5f-9c4f-99bb86a2a22e"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 FiniteLattices = "650210df-7c64-40ac-8e1f-94ea4f378b07"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [sources]
-Bornsampling = {path = "../.."}
+BornSampling = {path = "../.."}
 
 [compat]
-Bornsampling = "0.1"
+BornSampling = "0.1"
 CairoMakie = "0.15"
 FiniteLattices = "2.2"
 Statistics = "1.11"

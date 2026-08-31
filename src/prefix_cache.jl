@@ -144,7 +144,7 @@ function _new_prefix_cache(
     nodes = Vector{Union{Nothing,PrefixNode{R}}}(undef, capacity)
     fill!(nodes, nothing)
     resident_limit = disk ? maxsize : capacity
-    directory = disk ? mktempdir(; prefix="Bornsampling-prefix-") : nothing
+    directory = disk ? mktempdir(; prefix="BornSampling-prefix-") : nothing
 
     return PrefixCache{T,R,F,E}(
         nodes,

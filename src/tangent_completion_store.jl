@@ -17,7 +17,7 @@ function TangentCompletionStore{C}(
     values = Vector{Union{Nothing,C}}(undef, Int(length))
     fill!(values, nothing)
     directory = disk ?
-                mktempdir(; prefix="Bornsampling-tangent-completion-") :
+                mktempdir(; prefix="BornSampling-tangent-completion-") :
                 nothing
     return TangentCompletionStore{C}(values, directory)
 end

@@ -1,28 +1,28 @@
-import Bornsampling
+import BornSampling
 using Documenter
 
 DocMeta.setdocmeta!(
-    Bornsampling,
+    BornSampling,
     :DocTestSetup,
     quote
-        import Bornsampling
-        const FiniteMPS = Bornsampling.FiniteMPS
-        const TK = Bornsampling.TK
-        const Random = Bornsampling.Random
+        import BornSampling
+        const FiniteMPS = BornSampling.FiniteMPS
+        const TK = BornSampling.TK
+        const Random = BornSampling.Random
     end;
     recursive=true,
 )
 
 makedocs(
-    modules=[Bornsampling],
+    modules=[BornSampling],
     authors="Qiaoyi Li",
-    sitename="Bornsampling.jl",
+    sitename="BornSampling.jl",
     remotes=nothing,
     checkdocs=:exports,
     format=Documenter.HTML(
-        canonical="https://Qiaoyi-Li.github.io/Bornsampling.jl",
+        canonical="https://Qiaoyi-Li.github.io/BornSampling.jl",
         edit_link="main",
-        repolink="https://github.com/Qiaoyi-Li/Bornsampling.jl",
+        repolink="https://github.com/Qiaoyi-Li/BornSampling.jl",
     ),
     pages=[
         "Home" => "index.md",
@@ -33,6 +33,6 @@ makedocs(
 )
 
 deploydocs(
-    repo="github.com/Qiaoyi-Li/Bornsampling.jl.git",
+    repo="github.com/Qiaoyi-Li/BornSampling.jl.git",
     devbranch="main",
 )

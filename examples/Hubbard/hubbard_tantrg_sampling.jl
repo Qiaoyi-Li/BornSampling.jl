@@ -1,11 +1,11 @@
-import Bornsampling
-using Bornsampling.FiniteMPS
-using Bornsampling.Random
+import BornSampling
+using BornSampling.FiniteMPS
+using BornSampling.Random
 using CairoMakie
 using FiniteLattices
 using Statistics
 
-const TK = Bornsampling.TK
+const TK = BornSampling.TK
 
 # Model and tanTRG parameters.
 const L = 8
@@ -276,11 +276,11 @@ function main()
     # thermal factor in place for the final sampling phase.
     local sampler
     sampler_compilation_seconds =
-        @elapsed sampler = Bornsampling.BornSampler(factor)
+        @elapsed sampler = BornSampling.BornSampler(factor)
 
     local configurations
     sampling_seconds = @elapsed begin
-        configurations = Bornsampling.bornsample!(
+        configurations = BornSampling.bornsample!(
             MersenneTwister(RANDOM_SEED),
             sampler,
             Ns;

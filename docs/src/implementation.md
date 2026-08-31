@@ -1,6 +1,6 @@
 # [Implementation](@id implementation)
 
-Bornsampling is organized around one left-to-right factor propagation.  The
+BornSampling is organized around one left-to-right factor propagation.  The
 probability model determines the sampling mode, while compiled local plans
 provide the symmetry-aware contractions used by every mode.
 
@@ -15,7 +15,7 @@ A_i[\ell_i,x_i,r_i],
 ```
 
 and the contracted network defines an amplitude ``\psi(\boldsymbol{x})``.
-Bornsampling draws the physical configuration from
+BornSampling draws the physical configuration from
 
 ```math
 p(\boldsymbol{x})
@@ -232,13 +232,13 @@ history compression and has ``O(D^3)`` worst-case work.
 
 ## Global modes and local tensor ranks
 
-The outer `Bornsampling.FiniteMPS` concrete type chooses the global semantics:
+The outer `BornSampling.FiniteMPS` concrete type chooses the global semantics:
 
 | input and constructor | sampled outcome | factor update |
 |:--|:--|:--|
-| `Bornsampling.FiniteMPS.MPS` | ``x_i`` | pure rank-one propagation |
-| `Bornsampling.FiniteMPS.MPO`, `purified=true` | ``x_i`` | purification trace and exact factor compression |
-| `Bornsampling.FiniteMPS.MPO`, `purified=false` | ``(x_i,y_i)`` | joint rank-one propagation |
+| `BornSampling.FiniteMPS.MPS` | ``x_i`` | pure rank-one propagation |
+| `BornSampling.FiniteMPS.MPO`, `purified=true` | ``x_i`` | purification trace and exact factor compression |
+| `BornSampling.FiniteMPS.MPO`, `purified=false` | ``(x_i,y_i)`` | joint rank-one propagation |
 | `FiniteMPSTangents.TangentMPS`, `purified=true` | ``x_i`` | common ``(U,V_q)`` history propagation |
 | `FiniteMPSTangents.TangentMPS`, `purified=false` | one global ``q``, then ``(x_i,y_i)`` | fixed-q rank-one history propagation |
 
@@ -275,7 +275,7 @@ the interference between original sectors that share a residual charge.
 ### Unique and fusion-tree paths
 
 The contraction style is selected once through
-`Bornsampling.TK.FusionStyle(sector_type)`:
+`BornSampling.TK.FusionStyle(sector_type)`:
 
 - `UniqueStyle` contracts one-dimensional irrep carriers directly from the
   reduced block view with matrix multiplication.
