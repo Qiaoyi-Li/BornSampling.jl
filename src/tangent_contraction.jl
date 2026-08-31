@@ -224,6 +224,129 @@ function _apply_route!(
     return nothing
 end
 
+@inline function _tangent_factor_block_range(
+    info::ResidualSpaceInfo,
+    slot::Int,
+)
+    first_row = 1
+    @inbounds for preceding in 1:(slot - 1)
+        first_row += info.dimensions[preceding]
+    end
+    return first_row:(first_row + info.dimensions[slot] - 1)
+end
+
+function _scale_tangent_factor_destination!(destination, beta)
+    if iszero(beta)
+        fill!(destination, zero(eltype(destination)))
+    elseif !isone(beta)
+        @inbounds for index in eachindex(destination)
+            destination[index] *= beta
+        end
+    end
+    return destination
+end
+
+"""
+    _apply_routes_to_factor!(destination, source, plan, physical,
+                             purification, scratch[, beta])
+
+Apply the fixed local-basis channel compiled in `plan` directly to a dense
+tangent factor. Rows of `source` and `destination` are concatenated residual
+blocks, while their common columns are purification-history factors. `beta`
+scales `destination` before the channel contribution is added; in particular,
+`beta = 0` starts a new factor and `beta = 1` accumulates another channel into
+an existing factor.
+
+Each `ChannelRoute` receives only its residual input and output block. The
+route's original-sector transitions are therefore accumulated coherently by
+`_apply_route!` without materializing the channel through an identity matrix.
+`source` and `destination` must not alias.
+"""
+function _apply_routes_to_factor_impl!(
+    destination::AbstractMatrix,
+    source::AbstractMatrix,
+    plan::SitePlan,
+    physical::BasisInfo,
+    purification,
+    scratch,
+    beta,
+)
+    source_rows = sum(plan.residual_left.dimensions)
+    destination_rows = sum(plan.residual_right.dimensions)
+    size(source, 1) == source_rows || throw(DimensionMismatch(
+        "source factor has $(size(source, 1)) rows; expected $source_rows",
+    ))
+    size(destination, 1) == destination_rows || throw(DimensionMismatch(
+        "destination factor has $(size(destination, 1)) rows; " *
+        "expected $destination_rows",
+    ))
+    size(destination, 2) == size(source, 2) || throw(DimensionMismatch(
+        "source and destination factors have different column counts",
+    ))
+
+    _scale_tangent_factor_destination!(destination, beta)
+    for route in _channel_routes(plan, physical, purification)
+        left_rows = _tangent_factor_block_range(
+            plan.residual_left,
+            route.left_slot,
+        )
+        right_rows = _tangent_factor_block_range(
+            plan.residual_right,
+            route.right_slot,
+        )
+        _apply_route!(
+            view(destination, right_rows, :),
+            view(source, left_rows, :),
+            plan,
+            route,
+            physical,
+            purification,
+            scratch,
+        )
+    end
+    return destination
+end
+
+function _apply_routes_to_factor!(
+    destination::AbstractMatrix,
+    source::AbstractMatrix,
+    plan::Union{SitePlan{3},SitePlan{4}},
+    physical::BasisInfo,
+    purification::BasisInfo,
+    scratch,
+    beta=zero(eltype(destination)),
+)
+    return _apply_routes_to_factor_impl!(
+        destination,
+        source,
+        plan,
+        physical,
+        purification,
+        scratch,
+        beta,
+    )
+end
+
+function _apply_routes_to_factor!(
+    destination::AbstractMatrix,
+    source::AbstractMatrix,
+    plan::SitePlan{5},
+    physical::BasisInfo,
+    purification::NTuple{2,BasisInfo},
+    scratch,
+    beta=zero(eltype(destination)),
+)
+    return _apply_routes_to_factor_impl!(
+        destination,
+        source,
+        plan,
+        physical,
+        purification,
+        scratch,
+        beta,
+    )
+end
+
 function _apply_route!(
     Yroute::AbstractMatrix,
     Cblock::AbstractMatrix,

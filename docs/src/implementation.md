@@ -57,6 +57,30 @@ p(\boldsymbol{x})
 Thus discarding ``\boldsymbol{y}`` from joint samples also produces samples
 distributed according to the exact physical marginal ``p(\boldsymbol{x})``.
 
+### Tangent-vector states
+
+A `FiniteMPSTangents.TangentMPS` represents the Hilbert-space state
+
+```math
+|\Phi_{\boldsymbol y,q}\rangle
+=\sum_{j=1}^L
+A^l_1\cdots A^l_{j-1}B_{j,q}A^r_{j+1}\cdots A^r_L.
+```
+
+The insertion-site sum is coherent: all same-``q`` cross terms are retained.
+The extra ``q`` leg is one persistent global label, not a virtual bond and not
+a distinct local outcome at every site. Traced tangent sampling uses
+
+```math
+\rho=\sum_{\boldsymbol y,q}
+|\Phi_{\boldsymbol y,q}\rangle\langle\Phi_{\boldsymbol y,q}|,
+```
+
+whereas joint tangent sampling draws ``(\boldsymbol x,\boldsymbol y,q)``. A
+synthetic first sampling layer draws ``q`` once when that global leg exists;
+site layers then propagate only the selected ``q``. The external configuration
+remains ordered as ``[\boldsymbol x;\boldsymbol y;q]``.
+
 ### Sequential probabilities
 
 At site ``i``, let ``a_i`` denote the sampled local outcome: ``x_i`` in MPS
@@ -198,6 +222,14 @@ purification can raise the factor rank to ``D`` and gives ``O(D^3)`` worst-case
 work.  In every mode the environment remains represented lazily by
 ``C_iC_i^\dagger``.
 
+For tangent joint sampling, fixing the synthetic global ``q`` root and one
+local ``y_i`` at every site likewise keeps the history factor rank one. The
+hot path applies each compiled residual-block route directly to the ``U`` and
+``V_q`` factor columns, without materializing a dense local channel. Thus the
+fixed-``q`` MPS/MPO joint propagation has the same dense-equivalent
+``O(D^2)`` character. Traced local purification may require a common exact
+history compression and has ``O(D^3)`` worst-case work.
+
 ## Global modes and local tensor ranks
 
 The outer `Bornsampling.FiniteMPS` concrete type chooses the global semantics:
@@ -207,6 +239,8 @@ The outer `Bornsampling.FiniteMPS` concrete type chooses the global semantics:
 | `Bornsampling.FiniteMPS.MPS` | ``x_i`` | pure rank-one propagation |
 | `Bornsampling.FiniteMPS.MPO`, `purified=true` | ``x_i`` | purification trace and exact factor compression |
 | `Bornsampling.FiniteMPS.MPO`, `purified=false` | ``(x_i,y_i)`` | joint rank-one propagation |
+| `FiniteMPSTangents.TangentMPS`, `purified=true` | ``x_i`` | common ``(U,V_q)`` history propagation |
+| `FiniteMPSTangents.TangentMPS`, `purified=false` | one global ``q``, then ``(x_i,y_i)`` | fixed-q rank-one history propagation |
 
 Construction checks once that every tensor in an MPS is rank three.  An MPO
 may mix rank-three and rank-four sites.  At a rank-three MPO site, the local
@@ -290,6 +324,34 @@ Parallel publication uses narrow locks:
 This synchronization belongs to one batched `bornsample!` invocation. The
 sampler's public concurrency contract leaves coordination between simultaneous
 external invocations to the caller.
+
+### Tangent suffix completions
+
+Before a nonempty tangent batch enters the shared left-to-right scheduler, it
+performs one right-to-left sweep of q-resolved quadratic environments:
+
+```math
+I=R^\dagger R,\qquad K_q=R^\dagger T_q,\qquad
+N_q=T_q^\dagger T_q.
+```
+
+These matrices complete the sampled prefix weight without expanding the
+``L\times L`` insertion-site cross terms. Each metric stores only its nonzero
+residual-sector block pairs, including the possibly charge-shifting pairs of
+``K_q``; each transfer visits only compatible channel/metric blocks. The setup
+therefore has blockwise cubic cost (worst-case dense equivalent
+``O(LQD^3)``) once per batch, not once per shot. Every site completion is then
+consumed exactly once by the outer layer scheduler and shared read-only by all
+workers. The same-site ``B^\dagger I B`` term enters once; the two ``K_q``
+orientations account for distinct-site cross terms without double counting.
+
+With `disk=false`, pending completions live in batch memory. With `disk=true`,
+the first active completion stays in memory and the right sweep serializes the
+rest. The scheduler loads one completion before its layer barrier, and that
+file is immediately deleted. Active right-environment memory is therefore
+constant in chain length; all remaining files and references are removed by
+the batch `finally` cleanup. This deterministic completion store is separate
+from the probability-ranked prefix cache and has no `maxsize` policy.
 
 ## Probability-ranked environment storage
 

@@ -851,6 +851,48 @@ function _copy_active_weights(workspace, count::Int)
     return weights
 end
 
+# Ordinary MPS/MPO sampling has no batch-owned suffix environment. Tangent
+# sampling adds a run object later and supplies one immutable completion per
+# sampled layer through the same prefix-tree scheduler.
+struct NoCompletionRun end
+struct NoCompletion end
+
+const _NO_COMPLETION = NoCompletion()
+
+@inline _begin_sampling_run(::BornSampler; disk::Bool) = NoCompletionRun()
+@inline _take_sampling_completion!(::NoCompletionRun, ::Int) = _NO_COMPLETION
+@inline _cleanup_sampling_run!(::NoCompletionRun) = nothing
+
+@inline function _initialize_prefix_cache_with_completion!(
+    sampler,
+    workspace,
+    cache,
+    ::NoCompletion,
+)
+    return _initialize_prefix_cache!(sampler, workspace, cache)
+end
+
+@inline function _build_prefix_child_with_completion!(
+    sampler,
+    workspace,
+    current_cache,
+    next_cache,
+    parent,
+    selected::Int,
+    site::Int,
+    ::NoCompletion,
+)
+    return _build_prefix_child!(
+        sampler,
+        workspace,
+        current_cache,
+        next_cache,
+        parent,
+        selected,
+        site,
+    )
+end
+
 @inline _prefix_environment_type(
     ::BornSampler{TracedMPOMode},
     ::Type{F},
@@ -1015,6 +1057,7 @@ function _get_or_build_prefix_child!(
     parent::PrefixNode,
     selected::Int,
     site::Int,
+    next_completion,
 )
     slot = parent.children[selected]
     child_id = _child_id(slot)
@@ -1024,7 +1067,7 @@ function _get_or_build_prefix_child!(
     try
         child_id = _child_id(slot)
         if iszero(child_id)
-            child = _build_prefix_child!(
+            child = _build_prefix_child_with_completion!(
                 sampler,
                 workspace,
                 current_cache,
@@ -1032,6 +1075,7 @@ function _get_or_build_prefix_child!(
                 parent,
                 selected,
                 site,
+                next_completion,
             )
             # The node and its complete resident/disk environment become
             # visible before the release publication of this child id.
@@ -1042,6 +1086,27 @@ function _get_or_build_prefix_child!(
     finally
         unlock(slot.lock)
     end
+end
+
+function _get_or_build_prefix_child!(
+    sampler::BornSampler,
+    workspace,
+    current_cache::PrefixCache,
+    next_cache::PrefixCache,
+    parent::PrefixNode,
+    selected::Int,
+    site::Int,
+)
+    return _get_or_build_prefix_child!(
+        sampler,
+        workspace,
+        current_cache,
+        next_cache,
+        parent,
+        selected,
+        site,
+        _NO_COMPLETION,
+    )
 end
 
 function _draw_cached_outcome!(
@@ -1081,6 +1146,7 @@ function _advance_cached_layer_shot!(
     configuration::Matrix{Int},
     shot::Int,
     site::Int,
+    next_completion,
 )
     node, selected, _ = _draw_cached_outcome!(
         rng,
@@ -1100,9 +1166,37 @@ function _advance_cached_layer_shot!(
         node,
         selected,
         site,
+        next_completion,
     )
     @inbounds next_node_ids[shot] = child.id
     return nothing
+end
+
+function _advance_cached_layer_shot!(
+    rng,
+    sampler::BornSampler,
+    workspace,
+    current_cache::PrefixCache,
+    next_cache::PrefixCache,
+    current_node_ids::Vector{Int},
+    next_node_ids::Vector{Int},
+    configuration::Matrix{Int},
+    shot::Int,
+    site::Int,
+)
+    return _advance_cached_layer_shot!(
+        rng,
+        sampler,
+        workspace,
+        current_cache,
+        next_cache,
+        current_node_ids,
+        next_node_ids,
+        configuration,
+        shot,
+        site,
+        _NO_COMPLETION,
+    )
 end
 
 function _finish_cached_layer_shot!(
@@ -1142,6 +1236,7 @@ function _advance_cached_layer!(
     site::Int,
     nshots::Int,
     worker_count::Int,
+    next_completion,
 )
     next_shot = Threads.Atomic{Int}(1)
     Threads.@sync for worker_id in 1:worker_count
@@ -1161,11 +1256,39 @@ function _advance_cached_layer!(
                     configuration,
                     shot,
                     site,
+                    next_completion,
                 )
             end
         end
     end
     return nothing
+end
+
+function _advance_cached_layer!(
+    shot_rngs,
+    sampler::BornSampler,
+    current_cache::PrefixCache,
+    next_cache::PrefixCache,
+    current_node_ids::Vector{Int},
+    next_node_ids::Vector{Int},
+    configuration::Matrix{Int},
+    site::Int,
+    nshots::Int,
+    worker_count::Int,
+)
+    return _advance_cached_layer!(
+        shot_rngs,
+        sampler,
+        current_cache,
+        next_cache,
+        current_node_ids,
+        next_node_ids,
+        configuration,
+        site,
+        nshots,
+        worker_count,
+        _NO_COMPLETION,
+    )
 end
 
 function _finish_cached_layer!(
@@ -1225,7 +1348,11 @@ probability top-`maxsize` resident cache and raw temporary files. An MPS or
 joint-MPO node stores one normalized collapsed factor. A traced-MPO node instead
 stores the complete bank of uncompressed next-physical-outcome factors; an
 outcome is moved out of that bank and compressed only when its child edge is
-first used.
+first used. A tangent batch additionally builds one q-resolved right suffix
+sweep for the whole call. With `disk=true`, those deterministic per-layer
+completions use a separate consume-once store: each is loaded before the layer
+barrier and deleted after use. `maxsize` controls only prefix-frontier
+residency, not tangent completion storage.
 """
 function bornsample!(
     rng::Random.AbstractRNG,
@@ -1268,26 +1395,32 @@ function bornsample!(
         shot_rngs[shot] = Random.Xoshiro(rand(rng, UInt64))
     end
 
-    Environment = _prefix_environment_type(sampler, Factor)
-    current_cache = _new_prefix_cache(
-        Environment,
-        Factor,
-        Rprob,
-        1;
-        disk=disk && chain_length > 1,
-        maxsize=maxsize,
-    )
+    run = _begin_sampling_run(sampler; disk=disk)
+    current_cache = nothing
     next_cache = nothing
     try
-        root = _initialize_prefix_cache!(
+        Environment = _prefix_environment_type(sampler, Factor)
+        current_cache = _new_prefix_cache(
+            Environment,
+            Factor,
+            Rprob,
+            1;
+            disk=disk && chain_length > 1,
+            maxsize=maxsize,
+        )
+        root_completion = _take_sampling_completion!(run, 1)
+        root = _initialize_prefix_cache_with_completion!(
             sampler,
             first(sampler.workspaces),
             current_cache,
+            root_completion,
         )
+        root_completion = nothing
         current_node_ids = fill(root.id, nshots)
         next_node_ids = Vector{Int}(undef, nshots)
 
         for site in 1:(chain_length - 1)
+            next_completion = _take_sampling_completion!(run, site + 1)
             next_cache = _new_prefix_cache(
                 Environment,
                 Factor,
@@ -1307,7 +1440,9 @@ function bornsample!(
                 site,
                 nshots,
                 worker_count,
+                next_completion,
             )
+            next_completion = nothing
 
             _cleanup_prefix_cache!(current_cache)
             current_cache = next_cache
@@ -1327,8 +1462,15 @@ function bornsample!(
             worker_count,
         )
     finally
-        next_cache === nothing || _cleanup_prefix_cache!(next_cache)
-        _cleanup_prefix_cache!(current_cache)
+        try
+            next_cache === nothing || _cleanup_prefix_cache!(next_cache)
+        finally
+            try
+                current_cache === nothing || _cleanup_prefix_cache!(current_cache)
+            finally
+                _cleanup_sampling_run!(run)
+            end
+        end
     end
 
     return (

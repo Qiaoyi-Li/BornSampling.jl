@@ -1,13 +1,9 @@
-struct TangentMode <: PhysicalSamplingMode end
+struct TracedTangentMode <: PhysicalSamplingMode end
+struct JointTangentMode <: AbstractSamplingMode end
 
-"""
-One local tensor-network state-machine step for a tangent MPS.
+const TangentSamplingMode = Union{TracedTangentMode,JointTangentMode}
 
-`left` propagates a prefix before its unique tangent insertion, `right`
-propagates a prefix after the insertion, and `insertion` changes between those
-two states.  Local purification and persistent symmetry bases are deliberately
-separate.
-"""
+"""One local state-machine step for the coherent single-insertion tangent state."""
 struct TangentLocalPlan{AL,AR,B,P,LocalBasis,SymmetryBasis}
     left::AL
     right::AR
@@ -17,50 +13,71 @@ struct TangentLocalPlan{AL,AR,B,P,LocalBasis,SymmetryBasis}
     symmetry_basis::SymmetryBasis
 end
 
-"""
-The three suffix Gram layers needed to complete a factorized tangent prefix.
-
-For suffix maps `R` (insertion already occurred) and `T_q` (insertion still in
-the suffix), the fields represent `R'R`, `R'T_q`, and `sum_q T_q'T_q`.
-The persistent symmetry index is the third axis of `cross` and is never fused
-with a virtual space.
-"""
-struct TangentCompletionMetric{T,M<:Matrix{T},A<:Array{T,3}}
-    inserted::M
-    cross::A
-    uninserted::M
-end
-
-struct TangentSitePlan{P,E} <: AbstractSitePlan
+struct TangentSitePlan{P} <: AbstractSitePlan
     step::P
-    completion::E
+    physical_row::Int
+    purification_row::Int
+end
+
+struct TangentGlobalQPlan{B} <: AbstractSitePlan
+    symmetry_basis::B
+    output_row::Int
+end
+
+"""One deterministic sparse matrix over pairs of residual-sector blocks."""
+struct TangentBlockMatrix{T}
+    keys::Vector{NTuple{2,Int}}
+    blocks::Vector{Matrix{T}}
+    index::Dict{NTuple{2,Int},Int}
+end
+
+TangentBlockMatrix{T}() where {T} = TangentBlockMatrix{T}(
+    NTuple{2,Int}[],
+    Matrix{T}[],
+    Dict{NTuple{2,Int},Int}(),
+)
+
+"""One residual input/output block of a fixed local-basis channel."""
+struct TangentChannelBlock{T}
+    left_slot::Int
+    right_slot::Int
+    data::Matrix{T}
 end
 
 """
-A sampled tangent prefix in a common purification-history factor basis.
+The q-resolved suffix Gram layers for a tangent prefix.
 
-`uninserted[:, h]` is the prefix amplitude before the tangent insertion.
-`inserted[:, q, h]` is the coherent sum of all insertions already encountered.
-Both fields always undergo the same history-space compression.
+The fields are `I = R'R`, `K_q = R'T_q`, and `N_q = T_q'T_q`. Each quadratic
+map stores only its compatible residual-sector pairs; in particular, `K_q` may
+contain off-diagonal sector pairs carrying the fixed q charge. The q family is
+kept as a vector and is never fused with a virtual space.
 """
-struct TangentPrefixFactor{T,M<:Matrix{T},A<:Array{T,3}}
+struct TangentCompletionMetric{T}
+    ranges::Vector{UnitRange{Int}}
+    inserted::TangentBlockMatrix{T}
+    cross::Vector{TangentBlockMatrix{T}}
+    uninserted::Vector{TangentBlockMatrix{T}}
+end
+
+"""A sampled tangent prefix in one common purification-history factor basis."""
+struct TangentPrefixFactor{T,M<:Matrix{T},A<:Array{T,3},I<:Vector{Int}}
     uninserted::M
     inserted::A
+    symmetry_indices::I
 end
 
-mutable struct TangentSamplingWorkspace{T,R,Scratch}
+mutable struct TangentSamplingWorkspace{
+    M<:AbstractSamplingMode,T,R,Scratch,
+}
     q::Vector{R}
     route_output::Matrix{T}
     identity::Matrix{T}
-    left_channel::Matrix{T}
-    right_channel::Matrix{T}
-    insertion_channel::Matrix{T}
     matrix_scratch::Matrix{T}
     factor_scratch::Matrix{T}
     scratch::Scratch
 end
 
-"""A physical-branch bank for one tangent sampled prefix."""
+"""A complete bank of uncompressed tangent branch factors for one prefix."""
 mutable struct TangentBranchBundle{F}
     factors::Vector{Union{Nothing,F}}
 end
@@ -69,6 +86,12 @@ function TangentBranchBundle(factors::AbstractVector{F}) where {F}
     owned = Vector{Union{Nothing,F}}(undef, length(factors))
     copyto!(owned, factors)
     return TangentBranchBundle{F}(owned)
+end
+
+mutable struct TangentSamplingRun{C,S}
+    store::S
+    root_completion::Union{Nothing,C}
+    has_global_q_root::Bool
 end
 
 @inline _tensor_rank(::FiniteMPS.MPSTensor{R}) where {R} = R
@@ -118,8 +141,10 @@ end
     plan::SitePlan{5},
     local_index::Int,
     symmetry::Int,
-) = (first(plan.purification_basis)[local_index],
-     last(plan.purification_basis)[symmetry])
+) = (
+    first(plan.purification_basis)[local_index],
+    last(plan.purification_basis)[symmetry],
+)
 
 @inline _residual_dimension(info::ResidualSpaceInfo) = sum(info.dimensions)
 
@@ -153,6 +178,7 @@ function _validate_tangent_tensors(state::FiniteMPSTangents.TangentMPS)
 
     symmetry_space = nothing
     symmetry_presence = nothing
+    operator_like = false
     for site in 1:L
         Al = state.base.Al[site]
         Ar = state.base.Ar[site]
@@ -161,10 +187,10 @@ function _validate_tangent_tensors(state::FiniteMPSTangents.TangentMPS)
         base_rank in (3, 4) || throw(ArgumentError(
             "site $site requires a rank-three or rank-four base tensor",
         ))
-        _tensor_rank(Ar) == base_rank ||
-            throw(ArgumentError(
-                "site $site has mismatched Al/Ar ranks",
-            ))
+        operator_like |= base_rank == 4
+        _tensor_rank(Ar) == base_rank || throw(ArgumentError(
+            "site $site has mismatched Al/Ar ranks",
+        ))
         insertion_rank = _tensor_rank(B)
         insertion_rank in (base_rank, base_rank + 1) || throw(ArgumentError(
             "site $site has unsupported base/tangent ranks " *
@@ -200,7 +226,8 @@ function _validate_tangent_tensors(state::FiniteMPSTangents.TangentMPS)
             ))
         end
         if has_symmetry
-            current_symmetry = insertion_rank == 4 ? purspace(B) : last(purspaces(B))
+            current_symmetry = insertion_rank == 4 ?
+                purspace(B) : last(purspaces(B))
             if symmetry_space === nothing
                 symmetry_space = current_symmetry
             else
@@ -213,7 +240,11 @@ function _validate_tangent_tensors(state::FiniteMPSTangents.TangentMPS)
             end
         end
     end
-    return symmetry_space
+    return (
+        symmetry_space=symmetry_space,
+        has_symmetry=something(symmetry_presence, false),
+        operator_like=operator_like,
+    )
 end
 
 function _tangent_sampling_spaces(state::FiniteMPSTangents.TangentMPS)
@@ -232,21 +263,18 @@ function _compile_tangent_local_plans(
     kernel_cache,
     residual,
 ) where {S}
-    L = length(state.B)
-    plans = Vector{TangentLocalPlan}(undef, L)
-    for site in 1:L
+    plans = Vector{TangentLocalPlan}(undef, length(state.B))
+    for site in eachindex(state.B)
         left_plan = _compile_site(state.base.Al[site], S, kernel_cache, residual)
         right_plan = _compile_site(state.base.Ar[site], S, kernel_cache, residual)
         insertion_plan = _compile_site(state.B[site], S, kernel_cache, residual)
-        local_basis = _local_purification_basis(left_plan)
-        symmetry_basis = _symmetry_basis(left_plan, insertion_plan)
         plans[site] = TangentLocalPlan(
             left_plan,
             right_plan,
             insertion_plan,
             left_plan.physical,
-            local_basis,
-            symmetry_basis,
+            _local_purification_basis(left_plan),
+            _symmetry_basis(left_plan, insertion_plan),
         )
     end
     return plans
@@ -274,11 +302,13 @@ function _tangent_scalar_type(state, local_plans)
 end
 
 function _allocate_tangent_workspace(
+    ::Type{M},
     ::Type{T},
     ::Type{R},
     ::Type{S},
     local_plans,
-) where {T,R,S}
+    has_global_q_root::Bool,
+) where {M<:TangentSamplingMode,T,R,S}
     all_site_plans = Any[]
     for step in local_plans
         append!(all_site_plans, (step.left, step.right, step.insertion))
@@ -303,60 +333,57 @@ function _allocate_tangent_workspace(
     symmetry_dimension = length(first(local_plans).symmetry_basis)
     maximum_history = maximum_local_purification *
                       (symmetry_dimension + 1) * maximum_dimension
-    qmax = maximum(step -> step.physical.fulldim, local_plans)
+    qmax = maximum(local_plans) do step
+        local_dimension = M === JointTangentMode ?
+                          length(step.local_purification_basis) : 1
+        step.physical.fulldim * local_dimension
+    end
+    has_global_q_root && (qmax = max(qmax, symmetry_dimension))
     scratch = _allocate_scratch(S, T, maximum_scratch)
-    return TangentSamplingWorkspace{T,R,typeof(scratch)}(
+    return TangentSamplingWorkspace{M,T,R,typeof(scratch)}(
         zeros(R, qmax),
         zeros(T, maximum_block, maximum_block),
         zeros(T, maximum_block, maximum_block),
-        zeros(T, maximum_dimension, maximum_dimension),
-        zeros(T, maximum_dimension, maximum_dimension),
-        zeros(T, maximum_dimension, maximum_dimension),
-        zeros(T, maximum_dimension, maximum_dimension),
-        zeros(T, maximum_dimension, maximum_history),
+        zeros(T, maximum_block, maximum_block),
+        zeros(T, maximum_block, maximum_history),
         scratch,
     )
 end
 
 function _clone_workspace(
-    workspace::TangentSamplingWorkspace{T,R},
-) where {T,R}
+    workspace::TangentSamplingWorkspace{M,T,R},
+) where {M,T,R}
     scratch = _zero_like(workspace.scratch)
-    return TangentSamplingWorkspace{T,R,typeof(scratch)}(
+    return TangentSamplingWorkspace{M,T,R,typeof(scratch)}(
         zeros(R, length(workspace.q)),
         zeros(T, size(workspace.route_output)),
         zeros(T, size(workspace.identity)),
-        zeros(T, size(workspace.left_channel)),
-        zeros(T, size(workspace.right_channel)),
-        zeros(T, size(workspace.insertion_channel)),
         zeros(T, size(workspace.matrix_scratch)),
         zeros(T, size(workspace.factor_scratch)),
         scratch,
     )
 end
 
-function _materialize_channel!(
-    storage::Matrix,
-    workspace::TangentSamplingWorkspace,
+# The quadratic right sweep uses the same compiled `ChannelRoute`s as the
+# prefix hot path, but materializes each nonzero residual block separately.
+# No matrix with the full concatenated residual dimension is formed.
+function _materialize_block_channel(
+    workspace::TangentSamplingWorkspace{M,T},
     plan::SitePlan,
     physical::BasisInfo,
     purification,
-)
-    left_dimension = _residual_dimension(plan.residual_left)
-    right_dimension = _residual_dimension(plan.residual_right)
-    channel = view(storage, 1:right_dimension, 1:left_dimension)
-    fill!(channel, zero(eltype(channel)))
-
+) where {M,T}
+    blocks = TangentChannelBlock{T}[]
     for route in _channel_routes(plan, physical, purification)
         rows = plan.residual_right.dimensions[route.right_slot]
         columns = plan.residual_left.dimensions[route.left_slot]
         identity = view(workspace.identity, 1:columns, 1:columns)
-        fill!(identity, zero(eltype(identity)))
+        fill!(identity, zero(T))
         @inbounds for diagonal in 1:columns
-            identity[diagonal, diagonal] = one(eltype(identity))
+            identity[diagonal, diagonal] = one(T)
         end
         route_output = view(workspace.route_output, 1:rows, 1:columns)
-        fill!(route_output, zero(eltype(route_output)))
+        fill!(route_output, zero(T))
         _apply_route!(
             route_output,
             identity,
@@ -366,73 +393,146 @@ function _materialize_channel!(
             purification,
             workspace.scratch,
         )
-        right_rows = _residual_range(plan.residual_right, route.right_slot)
-        left_rows = _residual_range(plan.residual_left, route.left_slot)
-        copyto!(view(channel, right_rows, left_rows), route_output)
+        push!(blocks, TangentChannelBlock{T}(
+            route.left_slot,
+            route.right_slot,
+            Matrix(route_output),
+        ))
     end
-    return channel
+    return blocks
+end
+
+@inline function _tangent_block(
+    matrix::TangentBlockMatrix,
+    row_slot::Int,
+    column_slot::Int,
+)
+    slot = get(matrix.index, (row_slot, column_slot), 0)
+    iszero(slot) && return nothing
+    return @inbounds matrix.blocks[slot]
+end
+
+function _tangent_destination_block!(
+    matrix::TangentBlockMatrix{T},
+    row_slot::Int,
+    column_slot::Int,
+    rows::Int,
+    columns::Int,
+) where {T}
+    key = (row_slot, column_slot)
+    slot = get(matrix.index, key, 0)
+    if iszero(slot)
+        push!(matrix.keys, key)
+        push!(matrix.blocks, zeros(T, rows, columns))
+        slot = length(matrix.blocks)
+        matrix.index[key] = slot
+    end
+    return @inbounds matrix.blocks[slot]
+end
+
+@inline _tangent_middle_block(
+    matrix::TangentBlockMatrix,
+    row_slot::Int,
+    column_slot::Int,
+    ::Val{false},
+) = _tangent_block(matrix, row_slot, column_slot)
+
+@inline function _tangent_middle_block(
+    matrix::TangentBlockMatrix,
+    row_slot::Int,
+    column_slot::Int,
+    ::Val{true},
+)
+    block = _tangent_block(matrix, column_slot, row_slot)
+    return block === nothing ? nothing : adjoint(block)
 end
 
 function _add_completion_transfer!(
-    destination,
-    bra_channel,
-    middle,
-    ket_channel,
-    workspace::TangentSamplingWorkspace,
-)
-    left_dimension = size(bra_channel, 2)
-    middle_dimension = size(bra_channel, 1)
-    right_dimension = size(ket_channel, 2)
-    temporary = view(
-        workspace.matrix_scratch,
-        1:left_dimension,
-        1:size(middle, 2),
-    )
-    mul!(temporary, adjoint(bra_channel), middle)
-    mul!(destination, temporary, ket_channel, one(eltype(destination)), one(eltype(destination)))
-    size(destination) == (left_dimension, right_dimension) || throw(DimensionMismatch(
-        "completion-transfer destination has inconsistent dimensions",
-    ))
-    middle_dimension == size(middle, 1) || throw(DimensionMismatch(
-        "completion metric and local channel have inconsistent dimensions",
-    ))
+    destination::TangentBlockMatrix{T},
+    bra_channel::Vector{TangentChannelBlock{T}},
+    middle::TangentBlockMatrix{T},
+    ket_channel::Vector{TangentChannelBlock{T}},
+    workspace::TangentSamplingWorkspace{M,T},
+    middle_adjoint::Val{A},
+) where {M,T,A}
+    for bra in bra_channel, ket in ket_channel
+        middle_block = _tangent_middle_block(
+            middle,
+            bra.right_slot,
+            ket.right_slot,
+            middle_adjoint,
+        )
+        middle_block === nothing && continue
+        result = _tangent_destination_block!(
+            destination,
+            bra.left_slot,
+            ket.left_slot,
+            size(bra.data, 2),
+            size(ket.data, 2),
+        )
+        temporary = view(
+            workspace.matrix_scratch,
+            1:size(bra.data, 2),
+            1:size(middle_block, 2),
+        )
+        mul!(temporary, adjoint(bra.data), middle_block)
+        mul!(result, temporary, ket.data, one(T), one(T))
+    end
     return nothing
+end
+
+@inline function _add_completion_transfer!(
+    destination::TangentBlockMatrix{T},
+    bra_channel::Vector{TangentChannelBlock{T}},
+    middle::TangentBlockMatrix{T},
+    ket_channel::Vector{TangentChannelBlock{T}},
+    workspace::TangentSamplingWorkspace{M,T},
+) where {M,T}
+    return _add_completion_transfer!(
+        destination,
+        bra_channel,
+        middle,
+        ket_channel,
+        workspace,
+        Val(false),
+    )
+end
+
+function _tangent_residual_ranges(dimensions)
+    ranges = Vector{UnitRange{Int}}(undef, length(dimensions))
+    first_row = 1
+    @inbounds for slot in eachindex(dimensions)
+        last_row = first_row + dimensions[slot] - 1
+        ranges[slot] = first_row:last_row
+        first_row = last_row + 1
+    end
+    return ranges
 end
 
 function _retreat_completion_metric(
     step::TangentLocalPlan,
     metric::TangentCompletionMetric{T},
-    workspace::TangentSamplingWorkspace{T},
-) where {T}
-    left_dimension = _residual_dimension(step.left.residual_left)
+    workspace::TangentSamplingWorkspace{M,T},
+) where {M,T}
     symmetry_dimension = length(step.symmetry_basis)
-    inserted = zeros(T, left_dimension, left_dimension)
-    cross = zeros(T, left_dimension, left_dimension, symmetry_dimension)
-    uninserted = zeros(T, left_dimension, left_dimension)
-
-    # `cross[:, :, q]` is G₁₀(q) = R†T(q), rather than its adjoint.
-    # `metric.uninserted` already contains the persistent-q trace, so the
-    # L†G₀₀L transfer belongs outside the q loop below.
+    inserted = TangentBlockMatrix{T}()
+    cross = [TangentBlockMatrix{T}() for _ in 1:symmetry_dimension]
+    uninserted = [TangentBlockMatrix{T}() for _ in 1:symmetry_dimension]
 
     for physical in step.left.physical_basis
         for local_index in eachindex(step.local_purification_basis)
-            left_auxiliary = _base_auxiliary(step.left, local_index)
-            right_auxiliary = _base_auxiliary(step.right, local_index)
-            left_channel = _materialize_channel!(
-                workspace.left_channel,
+            left_channel = _materialize_block_channel(
                 workspace,
                 step.left,
                 physical,
-                left_auxiliary,
+                _base_auxiliary(step.left, local_index),
             )
-            right_channel = _materialize_channel!(
-                workspace.right_channel,
+            right_channel = _materialize_block_channel(
                 workspace,
                 step.right,
                 physical,
-                right_auxiliary,
+                _base_auxiliary(step.right, local_index),
             )
-
             _add_completion_transfer!(
                 inserted,
                 right_channel,
@@ -440,82 +540,105 @@ function _retreat_completion_metric(
                 right_channel,
                 workspace,
             )
-            _add_completion_transfer!(
-                uninserted,
-                left_channel,
-                metric.uninserted,
-                left_channel,
-                workspace,
-            )
 
             for symmetry_index in eachindex(step.symmetry_basis)
-                insertion_auxiliary = _insertion_auxiliary(
-                    step.left,
-                    step.insertion,
-                    local_index,
-                    symmetry_index,
-                )
-                insertion_channel = _materialize_channel!(
-                    workspace.insertion_channel,
+                insertion_channel = _materialize_block_channel(
                     workspace,
                     step.insertion,
                     physical,
-                    insertion_auxiliary,
+                    _insertion_auxiliary(
+                        step.left,
+                        step.insertion,
+                        local_index,
+                        symmetry_index,
+                    ),
                 )
-                cross_slice = view(cross, :, :, symmetry_index)
-                metric_cross = view(metric.cross, :, :, symmetry_index)
+                metric_cross = metric.cross[symmetry_index]
+                metric_uninserted = metric.uninserted[symmetry_index]
 
+                # K'_q = R' I B_q + R' K_q L.
                 _add_completion_transfer!(
-                    cross_slice,
+                    cross[symmetry_index],
                     right_channel,
                     metric.inserted,
                     insertion_channel,
                     workspace,
                 )
                 _add_completion_transfer!(
-                    cross_slice,
+                    cross[symmetry_index],
                     right_channel,
                     metric_cross,
                     left_channel,
                     workspace,
                 )
+
+                # Same-site B'I B occurs once. The two K terms are the two
+                # orientations of every different-site cross term.
                 _add_completion_transfer!(
-                    uninserted,
+                    uninserted[symmetry_index],
+                    left_channel,
+                    metric_uninserted,
+                    left_channel,
+                    workspace,
+                )
+                _add_completion_transfer!(
+                    uninserted[symmetry_index],
                     insertion_channel,
                     metric.inserted,
                     insertion_channel,
                     workspace,
                 )
                 _add_completion_transfer!(
-                    uninserted,
+                    uninserted[symmetry_index],
                     insertion_channel,
                     metric_cross,
                     left_channel,
                     workspace,
                 )
                 _add_completion_transfer!(
-                    uninserted,
+                    uninserted[symmetry_index],
                     left_channel,
-                    adjoint(metric_cross),
+                    metric_cross,
                     insertion_channel,
                     workspace,
+                    Val(true),
                 )
             end
         end
     end
-    return TangentCompletionMetric(inserted, cross, uninserted)
+    return TangentCompletionMetric(
+        _tangent_residual_ranges(step.left.residual_left.dimensions),
+        inserted,
+        cross,
+        uninserted,
+    )
 end
 
 function _right_boundary_metric(::Type{T}, step::TangentLocalPlan) where {T}
-    dimension = _residual_dimension(step.right.residual_right)
+    residual = step.right.residual_right
+    dimension = _residual_dimension(residual)
     dimension == 1 || throw(ArgumentError(
         "the final right virtual space must be one-dimensional",
     ))
+    inserted = TangentBlockMatrix{T}()
+    for (slot, block_dimension) in pairs(residual.dimensions)
+        block = _tangent_destination_block!(
+            inserted,
+            slot,
+            slot,
+            block_dimension,
+            block_dimension,
+        )
+        @inbounds for diagonal in 1:block_dimension
+            block[diagonal, diagonal] = one(T)
+        end
+    end
     symmetry_dimension = length(step.symmetry_basis)
     return TangentCompletionMetric(
-        Matrix{T}(I, dimension, dimension),
-        zeros(T, dimension, dimension, symmetry_dimension),
-        zeros(T, dimension, dimension),
+        _tangent_residual_ranges(residual.dimensions),
+        inserted,
+        [TangentBlockMatrix{T}() for _ in 1:symmetry_dimension],
+        [TangentBlockMatrix{T}() for _ in 1:symmetry_dimension],
     )
 end
 
@@ -537,36 +660,63 @@ function _build_initial_tangent_factor(
     @inbounds for row in eachindex(boundary)
         uninserted[rows[row], 1] = boundary[row]
     end
-    inserted = zeros(T, dimension, length(step.symmetry_basis), 1)
-    return TangentPrefixFactor(uninserted, inserted)
+    symmetry_dimension = length(step.symmetry_basis)
+    inserted = zeros(T, dimension, symmetry_dimension, 1)
+    return TangentPrefixFactor(
+        uninserted,
+        inserted,
+        collect(1:symmetry_dimension),
+    )
+end
+
+function _build_tangent_plans(
+    local_plans,
+    ::Type{M},
+    operator_like::Bool,
+    has_symmetry::Bool,
+) where {M<:TangentSamplingMode}
+    L = length(local_plans)
+    joint = M === JointTangentMode
+    has_q_root = joint && has_symmetry
+    layers = Vector{AbstractSitePlan}(undef, L + Int(has_q_root))
+    offset = Int(has_q_root)
+    purification_offset = joint && operator_like ? L : 0
+    if has_q_root
+        qrow = L + purification_offset + 1
+        layers[1] = TangentGlobalQPlan(first(local_plans).symmetry_basis, qrow)
+    end
+    for site in 1:L
+        purification_row = purification_offset == 0 ? 0 : L + site
+        layers[offset + site] = TangentSitePlan(
+            local_plans[site],
+            site,
+            purification_row,
+        )
+    end
+    return layers
 end
 
 """
     BornSampler(tangent::FiniteMPSTangents.TangentMPS;
                 left_boundary=nothing, purified=true)
 
-Compile the Hilbert-space state represented by a finite-MPS tangent vector for
-repeated physical Born sampling. The tangent state is the coherent sum of its
-single-insertion terms. Local MPO purification legs and the persistent tangent
-symmetry leg are traced, so every returned configuration contains exactly one
-physical index per site; consequently `purified=false` is unsupported.
+Compile the Hilbert-space state represented by a finite-MPS tangent vector.
+The state is the coherent sum over all single-insertion sites. Construction
+compiles symmetry-aware local routes, while every nonempty sampling batch owns
+one right-to-left completion sweep and releases it at batch completion.
 
-Unlike the direct `MPS`/`MPO` constructor, this method neither canonicalizes nor
-mutates the tangent or its base point. The base must already satisfy the
-canonical-form contract imposed by `FiniteMPSTangents.BaseMPS`. Compiled
-contraction plans retain views into its tensor blocks, so neither object may be
-modified while the sampler is in use.
+With `purified=true`, all local purification indices and persistent global q
+are traced. With `purified=false`, local purification indices are sampled and
+a present q is sampled once at a synthetic root. Joint output is `[x; y; q]`,
+omitting absent groups. Rank-three sites in a mixed operator-valued base emit
+the synthetic local value `y=1`.
 """
 function BornSampler(
     state::FiniteMPSTangents.TangentMPS;
     left_boundary=nothing,
     purified::Bool=true,
 )
-    purified || throw(ArgumentError(
-        "TangentMPS sampling always traces local purification and persistent " *
-        "symmetry legs; purified=false is not supported",
-    ))
-    _validate_tangent_tensors(state)
+    layout = _validate_tangent_tensors(state)
     sector_type = TK.sectortype(first(state.base.Al).A)
     S = _style_type(first(state.base.Al))
     for tensors in (state.base.Al, state.base.Ar, state.B), tensor in tensors
@@ -582,11 +732,10 @@ function BornSampler(
         sector_type,
         _tangent_sampling_spaces(state),
     )
-    kernel_cache = _kernel_cache(S)
     local_plans = _compile_tangent_local_plans(
         state,
         S,
-        kernel_cache,
+        _kernel_cache(S),
         residual,
     )
     symmetry_dimension = length(first(local_plans).symmetry_basis)
@@ -595,25 +744,23 @@ function BornSampler(
             "persistent tangent symmetry dimensions differ between sites",
         ))
 
+    M = purified ? TracedTangentMode : JointTangentMode
     T = _tangent_scalar_type(state, local_plans)
     Rprob = typeof(real(zero(T)))
-    workspace = _allocate_tangent_workspace(T, Rprob, S, local_plans)
-
-    completion = _right_boundary_metric(T, last(local_plans))
-    completions = Vector{typeof(completion)}(undef, length(local_plans))
-    for site in reverse(eachindex(local_plans))
-        completions[site] = completion
-        completion = _retreat_completion_metric(
-            local_plans[site],
-            completion,
-            workspace,
-        )
-    end
-
-    plans = Vector{AbstractSitePlan}(undef, length(local_plans))
-    for site in eachindex(local_plans)
-        plans[site] = TangentSitePlan(local_plans[site], completions[site])
-    end
+    plans = _build_tangent_plans(
+        local_plans,
+        M,
+        layout.operator_like,
+        layout.has_symmetry,
+    )
+    workspace = _allocate_tangent_workspace(
+        M,
+        T,
+        Rprob,
+        S,
+        local_plans,
+        first(plans) isa TangentGlobalQPlan,
+    )
     boundary = _prepare_left_boundary(
         left_boundary,
         T,
@@ -625,7 +772,7 @@ function BornSampler(
         first(local_plans),
     )
     return BornSampler{
-        TangentMode,
+        M,
         typeof(state),
         typeof(plans),
         typeof(initial_factor),
@@ -638,8 +785,74 @@ function BornSampler(
     )
 end
 
-function _advance_tangent_prefix(
-    workspace::TangentSamplingWorkspace{T},
+@inline function _tangent_local_steps(sampler::BornSampler{M}) where {
+    M<:TangentSamplingMode,
+}
+    offset = first(sampler.plans) isa TangentGlobalQPlan ? 1 : 0
+    return map((offset + 1):length(sampler.plans)) do layer
+        (sampler.plans[layer]::TangentSitePlan).step
+    end
+end
+
+function _begin_sampling_run(
+    sampler::BornSampler{M};
+    disk::Bool,
+) where {M<:TangentSamplingMode}
+    steps = _tangent_local_steps(sampler)
+    workspace = first(sampler.workspaces)
+    completion = _right_boundary_metric(
+        eltype(workspace.route_output),
+        last(steps),
+    )
+    C = typeof(completion)
+    store = TangentCompletionStore{C}(length(steps); disk=disk)
+    try
+        has_global_q_root = first(sampler.plans) isa TangentGlobalQPlan
+        for site in reverse(eachindex(steps))
+            # The first sampling layer stays in RAM. Without a synthetic q
+            # root this is E₁ itself; with a q root, E₁ is needed by layer 2
+            # and is therefore stored while the fully retreated root stays in
+            # RAM.
+            if site > 1 || has_global_q_root
+                _put_completion!(store, site, completion)
+            end
+            if site > 1 || has_global_q_root
+                completion = _retreat_completion_metric(
+                    steps[site],
+                    completion,
+                    workspace,
+                )
+            end
+        end
+        return TangentSamplingRun{C,typeof(store)}(
+            store,
+            completion,
+            has_global_q_root,
+        )
+    catch
+        _cleanup_completion_store!(store)
+        rethrow()
+    end
+end
+
+function _take_sampling_completion!(run::TangentSamplingRun{C}, layer::Int) where {C}
+    if layer == 1
+        completion = run.root_completion
+        run.root_completion = nothing
+        return completion::C
+    end
+    site = run.has_global_q_root ? layer - 1 : layer
+    return _take_completion!(run.store, site)
+end
+
+function _cleanup_sampling_run!(run::TangentSamplingRun)
+    run.root_completion = nothing
+    _cleanup_completion_store!(run.store)
+    return nothing
+end
+
+function _advance_traced_tangent_prefix(
+    workspace::TangentSamplingWorkspace{TracedTangentMode,T},
     factor::TangentPrefixFactor{T},
     plan::TangentSitePlan,
     selected::Int,
@@ -647,7 +860,7 @@ function _advance_tangent_prefix(
     step = plan.step
     physical = step.left.physical_basis[selected]
     local_dimension = length(step.local_purification_basis)
-    symmetry_dimension = length(step.symmetry_basis)
+    symmetry_dimension = length(factor.symmetry_indices)
     history_dimension = size(factor.uninserted, 2)
     next_history = local_dimension * history_dimension
     right_dimension = _residual_dimension(step.left.residual_right)
@@ -659,32 +872,27 @@ function _advance_tangent_prefix(
             ((local_index - 1) * history_dimension + 1):
             (local_index * history_dimension)
         )
-        left_channel = _materialize_channel!(
-            workspace.left_channel,
-            workspace,
+        _apply_routes_to_factor!(
+            view(uninserted, :, columns),
+            factor.uninserted,
             step.left,
             physical,
             _base_auxiliary(step.left, local_index),
+            workspace.scratch,
         )
-        mul!(view(uninserted, :, columns), left_channel, factor.uninserted)
-
-        right_channel = _materialize_channel!(
-            workspace.right_channel,
-            workspace,
-            step.right,
-            physical,
-            _base_auxiliary(step.right, local_index),
-        )
-        for symmetry_index in 1:symmetry_dimension
-            destination = view(inserted, :, symmetry_index, columns)
-            mul!(
+        for (axis, symmetry_index) in pairs(factor.symmetry_indices)
+            destination = view(inserted, :, axis, columns)
+            _apply_routes_to_factor!(
                 destination,
-                right_channel,
-                view(factor.inserted, :, symmetry_index, :),
+                view(factor.inserted, :, axis, :),
+                step.right,
+                physical,
+                _base_auxiliary(step.right, local_index),
+                workspace.scratch,
             )
-            insertion_channel = _materialize_channel!(
-                workspace.insertion_channel,
-                workspace,
+            _apply_routes_to_factor!(
+                destination,
+                factor.uninserted,
                 step.insertion,
                 physical,
                 _insertion_auxiliary(
@@ -693,41 +901,170 @@ function _advance_tangent_prefix(
                     local_index,
                     symmetry_index,
                 ),
-            )
-            mul!(
-                destination,
-                insertion_channel,
-                factor.uninserted,
-                one(T),
+                workspace.scratch,
                 one(T),
             )
         end
     end
-    return TangentPrefixFactor(uninserted, inserted)
+    return TangentPrefixFactor(
+        uninserted,
+        inserted,
+        factor.symmetry_indices,
+    )
+end
+
+@inline function _tangent_joint_coordinates(plan::TangentSitePlan, selected::Int)
+    local_dimension = plan.purification_row == 0 ?
+                      1 : length(plan.step.local_purification_basis)
+    physical = div(selected - 1, local_dimension) + 1
+    local_index = rem(selected - 1, local_dimension) + 1
+    return physical, local_index
+end
+
+function _advance_joint_tangent_prefix(
+    workspace::TangentSamplingWorkspace{JointTangentMode,T},
+    factor::TangentPrefixFactor{T},
+    plan::TangentSitePlan,
+    selected::Int,
+) where {T}
+    length(factor.symmetry_indices) == 1 || throw(ArgumentError(
+        "joint tangent sampling must fix the global q before sampling sites",
+    ))
+    physical_index, local_index = _tangent_joint_coordinates(plan, selected)
+    step = plan.step
+    physical = step.left.physical_basis[physical_index]
+    right_dimension = _residual_dimension(step.left.residual_right)
+    history_dimension = size(factor.uninserted, 2)
+    uninserted = zeros(T, right_dimension, history_dimension)
+    inserted = zeros(T, right_dimension, 1, history_dimension)
+
+    _apply_routes_to_factor!(
+        uninserted,
+        factor.uninserted,
+        step.left,
+        physical,
+        _base_auxiliary(step.left, local_index),
+        workspace.scratch,
+    )
+    destination = view(inserted, :, 1, :)
+    _apply_routes_to_factor!(
+        destination,
+        view(factor.inserted, :, 1, :),
+        step.right,
+        physical,
+        _base_auxiliary(step.right, local_index),
+        workspace.scratch,
+    )
+    symmetry_index = only(factor.symmetry_indices)
+    _apply_routes_to_factor!(
+        destination,
+        factor.uninserted,
+        step.insertion,
+        physical,
+        _insertion_auxiliary(
+            step.left,
+            step.insertion,
+            local_index,
+            symmetry_index,
+        ),
+        workspace.scratch,
+        one(T),
+    )
+    return TangentPrefixFactor(
+        uninserted,
+        inserted,
+        factor.symmetry_indices,
+    )
+end
+
+@inline _advance_tangent_prefix(
+    workspace::TangentSamplingWorkspace{TracedTangentMode},
+    factor,
+    plan::TangentSitePlan,
+    selected::Int,
+) = _advance_traced_tangent_prefix(workspace, factor, plan, selected)
+
+@inline _advance_tangent_prefix(
+    workspace::TangentSamplingWorkspace{JointTangentMode},
+    factor,
+    plan::TangentSitePlan,
+    selected::Int,
+) = _advance_joint_tangent_prefix(workspace, factor, plan, selected)
+
+function _restrict_tangent_symmetry(
+    factor::TangentPrefixFactor{T},
+    symmetry_index::Int,
+) where {T}
+    axis = symmetry_index
+    inserted = Array{T,3}(
+        undef,
+        size(factor.inserted, 1),
+        1,
+        size(factor.inserted, 3),
+    )
+    copyto!(view(inserted, :, 1, :), view(factor.inserted, :, axis, :))
+    return TangentPrefixFactor(
+        copy(factor.uninserted),
+        inserted,
+        Int[symmetry_index],
+    )
+end
+
+function _tangent_block_bilinear(
+    workspace::TangentSamplingWorkspace{M,T},
+    bra::AbstractMatrix,
+    matrix::TangentBlockMatrix{T},
+    ket::AbstractMatrix,
+    ranges::Vector{UnitRange{Int}},
+) where {M,T}
+    columns = size(bra, 2)
+    value = zero(T)
+    @inbounds for slot in eachindex(matrix.keys)
+        row_slot, column_slot = matrix.keys[slot]
+        row_range = ranges[row_slot]
+        column_range = ranges[column_slot]
+        block = matrix.blocks[slot]
+        temporary = view(
+            workspace.factor_scratch,
+            1:length(row_range),
+            1:columns,
+        )
+        mul!(temporary, block, view(ket, column_range, :))
+        value += dot(view(bra, row_range, :), temporary)
+    end
+    return value
 end
 
 function _tangent_completion_weight(
-    workspace::TangentSamplingWorkspace{T},
+    workspace::TangentSamplingWorkspace{M,T},
     factor::TangentPrefixFactor{T},
     metric::TangentCompletionMetric{T},
-) where {T}
-    rows = size(factor.uninserted, 1)
-    columns = size(factor.uninserted, 2)
-    temporary = view(workspace.factor_scratch, 1:rows, 1:columns)
+) where {M,T}
     value = zero(T)
 
-    mul!(temporary, metric.uninserted, factor.uninserted)
-    value += dot(factor.uninserted, temporary)
-    for symmetry_index in axes(factor.inserted, 2)
-        inserted = view(factor.inserted, :, symmetry_index, :)
-        mul!(temporary, metric.inserted, inserted)
-        value += dot(inserted, temporary)
-        mul!(
-            temporary,
-            view(metric.cross, :, :, symmetry_index),
+    for (axis, symmetry_index) in pairs(factor.symmetry_indices)
+        inserted = view(factor.inserted, :, axis, :)
+        value += _tangent_block_bilinear(
+            workspace,
             factor.uninserted,
+            metric.uninserted[symmetry_index],
+            factor.uninserted,
+            metric.ranges,
         )
-        value += 2 * real(dot(inserted, temporary))
+        value += _tangent_block_bilinear(
+            workspace,
+            inserted,
+            metric.inserted,
+            inserted,
+            metric.ranges,
+        )
+        value += 2 * real(_tangent_block_bilinear(
+            workspace,
+            inserted,
+            metric.cross[symmetry_index],
+            factor.uninserted,
+            metric.ranges,
+        ))
     end
     result = real(value)
     scale = max(one(result), abs(result))
@@ -746,8 +1083,9 @@ function _compute_weights_and_factors!(
     workspace::TangentSamplingWorkspace,
     factor::TangentPrefixFactor,
     plan::TangentSitePlan,
+    completion::TangentCompletionMetric,
 )
-    count = plan.step.physical.fulldim
+    count = _outcome_count(workspace, plan)
     factors = Vector{typeof(factor)}(undef, count)
     @inbounds for selected in 1:count
         next_factor = _advance_tangent_prefix(
@@ -760,7 +1098,27 @@ function _compute_weights_and_factors!(
         workspace.q[selected] = _tangent_completion_weight(
             workspace,
             next_factor,
-            plan.completion,
+            completion,
+        )
+    end
+    return factors
+end
+
+function _compute_weights_and_factors!(
+    workspace::TangentSamplingWorkspace{JointTangentMode},
+    factor::TangentPrefixFactor,
+    plan::TangentGlobalQPlan,
+    completion::TangentCompletionMetric,
+)
+    count = length(plan.symmetry_basis)
+    factors = Vector{typeof(factor)}(undef, count)
+    @inbounds for symmetry_index in 1:count
+        next_factor = _restrict_tangent_symmetry(factor, symmetry_index)
+        factors[symmetry_index] = next_factor
+        workspace.q[symmetry_index] = _tangent_completion_weight(
+            workspace,
+            next_factor,
+            completion,
         )
     end
     return factors
@@ -769,9 +1127,10 @@ end
 function _compute_weights!(
     workspace::TangentSamplingWorkspace,
     factor::TangentPrefixFactor,
-    plan::TangentSitePlan,
+    plan::Union{TangentSitePlan,TangentGlobalQPlan},
+    completion::TangentCompletionMetric,
 )
-    _compute_weights_and_factors!(workspace, factor, plan)
+    _compute_weights_and_factors!(workspace, factor, plan, completion)
     return nothing
 end
 
@@ -784,13 +1143,13 @@ function _compress_tangent_factor(factor::TangentPrefixFactor{T}) where {T}
 
     stacked = Matrix{T}(undef, maximum_support, history_dimension)
     copyto!(view(stacked, 1:rows, :), factor.uninserted)
-    for symmetry_index in 1:symmetry_dimension
+    for symmetry_axis in 1:symmetry_dimension
         destination = (
-            (symmetry_index * rows + 1):((symmetry_index + 1) * rows)
+            (symmetry_axis * rows + 1):((symmetry_axis + 1) * rows)
         )
         copyto!(
             view(stacked, destination, :),
-            view(factor.inserted, :, symmetry_index, :),
+            view(factor.inserted, :, symmetry_axis, :),
         )
     end
     decomposition = qr(adjoint(stacked))
@@ -798,16 +1157,20 @@ function _compress_tangent_factor(factor::TangentPrefixFactor{T}) where {T}
     support = size(compressed, 2)
     uninserted = Matrix(view(compressed, 1:rows, 1:support))
     inserted = Array{T,3}(undef, rows, symmetry_dimension, support)
-    for symmetry_index in 1:symmetry_dimension
+    for symmetry_axis in 1:symmetry_dimension
         source = (
-            (symmetry_index * rows + 1):((symmetry_index + 1) * rows)
+            (symmetry_axis * rows + 1):((symmetry_axis + 1) * rows)
         )
         copyto!(
-            view(inserted, :, symmetry_index, :),
+            view(inserted, :, symmetry_axis, :),
             view(compressed, source, 1:support),
         )
     end
-    return TangentPrefixFactor(uninserted, inserted)
+    return TangentPrefixFactor(
+        uninserted,
+        inserted,
+        factor.symmetry_indices,
+    )
 end
 
 function _advance_built_tangent_factor!(factor, qselected)
@@ -819,68 +1182,131 @@ function _advance_built_tangent_factor!(factor, qselected)
 end
 
 @inline _outcome_count(
-    ::TangentSamplingWorkspace,
+    ::TangentSamplingWorkspace{TracedTangentMode},
     plan::TangentSitePlan,
 ) = plan.step.physical.fulldim
+
+@inline function _outcome_count(
+    ::TangentSamplingWorkspace{JointTangentMode},
+    plan::TangentSitePlan,
+)
+    local_dimension = plan.purification_row == 0 ?
+                      1 : length(plan.step.local_purification_basis)
+    return plan.step.physical.fulldim * local_dimension
+end
+
+@inline _outcome_count(
+    ::TangentSamplingWorkspace{JointTangentMode},
+    plan::TangentGlobalQPlan,
+) = length(plan.symmetry_basis)
+
+@inline function _tangent_configuration_length(sampler)
+    maximum_row = 0
+    for plan in sampler.plans
+        if plan isa TangentGlobalQPlan
+            maximum_row = max(maximum_row, plan.output_row)
+        else
+            site_plan = plan::TangentSitePlan
+            maximum_row = max(
+                maximum_row,
+                site_plan.physical_row,
+                site_plan.purification_row,
+            )
+        end
+    end
+    return maximum_row
+end
+
+@inline _configuration_length(sampler::BornSampler{TracedTangentMode}) =
+    _tangent_configuration_length(sampler)
+@inline _configuration_length(sampler::BornSampler{JointTangentMode}) =
+    _tangent_configuration_length(sampler)
 
 @inline function _store_outcome!(
     ::TangentSamplingWorkspace,
     configuration::AbstractVector,
-    site::Int,
-    chain_length::Int,
+    ::Int,
+    ::Int,
+    plan::TangentGlobalQPlan,
+    selected::Int,
+)
+    configuration[plan.output_row] = selected
+    return nothing
+end
+
+@inline function _store_outcome!(
+    ::TangentSamplingWorkspace{TracedTangentMode},
+    configuration::AbstractVector,
+    ::Int,
+    ::Int,
     plan::TangentSitePlan,
     selected::Int,
 )
-    configuration[site] = selected
+    configuration[plan.physical_row] = selected
+    return nothing
+end
+
+@inline function _store_outcome!(
+    ::TangentSamplingWorkspace{JointTangentMode},
+    configuration::AbstractVector,
+    ::Int,
+    ::Int,
+    plan::TangentSitePlan,
+    selected::Int,
+)
+    physical, local_index = _tangent_joint_coordinates(plan, selected)
+    configuration[plan.physical_row] = physical
+    iszero(plan.purification_row) ||
+        (configuration[plan.purification_row] = local_index)
     return nothing
 end
 
 @inline function _store_outcome!(
     ::TangentSamplingWorkspace,
     configuration::AbstractMatrix,
-    site::Int,
-    chain_length::Int,
+    ::Int,
+    ::Int,
+    shot::Int,
+    plan::TangentGlobalQPlan,
+    selected::Int,
+)
+    configuration[plan.output_row, shot] = selected
+    return nothing
+end
+
+@inline function _store_outcome!(
+    ::TangentSamplingWorkspace{TracedTangentMode},
+    configuration::AbstractMatrix,
+    ::Int,
+    ::Int,
     shot::Int,
     plan::TangentSitePlan,
     selected::Int,
 )
-    configuration[site, shot] = selected
+    configuration[plan.physical_row, shot] = selected
     return nothing
 end
 
-function _sample_site!(
-    rng,
-    workspace::TangentSamplingWorkspace,
-    factor::TangentPrefixFactor,
+@inline function _store_outcome!(
+    ::TangentSamplingWorkspace{JointTangentMode},
+    configuration::AbstractMatrix,
+    ::Int,
+    ::Int,
+    shot::Int,
     plan::TangentSitePlan,
-    config,
-    site::Int,
-    chain_length::Int,
+    selected::Int,
 )
-    factors = _compute_weights_and_factors!(workspace, factor, plan)
-    outcome_count = _outcome_count(workspace, plan)
-    z = _total_weight(workspace.q, outcome_count, site)
-    selected = _draw_outcome(rng, workspace.q, z, outcome_count)
-    qselected = workspace.q[selected]
-    next_factor = _advance_built_tangent_factor!(
-        factors[selected],
-        qselected,
-    )
-    _store_outcome!(
-        workspace,
-        config,
-        site,
-        chain_length,
-        plan,
-        selected,
-    )
-    return log(qselected) - log(z), next_factor
+    physical, local_index = _tangent_joint_coordinates(plan, selected)
+    configuration[plan.physical_row, shot] = physical
+    iszero(plan.purification_row) ||
+        (configuration[plan.purification_row, shot] = local_index)
+    return nothing
 end
 
 @inline _prefix_environment_type(
-    ::BornSampler{TangentMode},
+    ::BornSampler{M},
     ::Type{F},
-) where {F} = TangentBranchBundle{F}
+) where {M<:TangentSamplingMode,F} = TangentBranchBundle{F}
 
 function _new_prefix_cache(
     ::Type{E},
@@ -942,12 +1368,9 @@ function _read_tangent_branch(
     selected::Int,
 ) where {T,R,F}
     path = _branch_factor_path(cache, node.id, selected)
-    factor = open(deserialize, path)
+    factor = open(deserialize, path)::F
     rm(path; force=true)
-    factor isa F || throw(ArgumentError(
-        "cached tangent branch has type $(typeof(factor)); expected $F",
-    ))
-    return factor::F
+    return factor
 end
 
 function _take_tangent_branch!(
@@ -957,28 +1380,26 @@ function _take_tangent_branch!(
 ) where {T,R,F}
     bundle = get(cache.resident, node.id, nothing)
     if bundle !== nothing
-        owned = bundle.factors[selected]
-        owned === nothing && error(
-            "tangent branch $selected of prefix $(node.id) was already consumed",
-        )
+        owned = bundle.factors[selected]::F
         bundle.factors[selected] = nothing
-        return owned::F
+        return owned
     end
     return _read_tangent_branch(cache, node, selected)
 end
 
-function _initialize_prefix_cache!(
-    sampler::BornSampler{TangentMode},
-    workspace::TangentSamplingWorkspace,
+function _initialize_prefix_cache_with_completion!(
+    sampler::BornSampler{M},
+    workspace::TangentSamplingWorkspace{M},
     cache::PrefixCache{T,R,F,TangentBranchBundle{F}},
-) where {T,R,F}
+    completion::TangentCompletionMetric,
+) where {M<:TangentSamplingMode,T,R,F}
     factor = sampler.initial_factor
-    plan = first(sampler.plans)::TangentSitePlan
+    plan = first(sampler.plans)
     extendable = length(sampler.plans) > 1
     factors = if extendable
-        _compute_weights_and_factors!(workspace, factor, plan)
+        _compute_weights_and_factors!(workspace, factor, plan, completion)
     else
-        _compute_weights!(workspace, factor, plan)
+        _compute_weights!(workspace, factor, plan, completion)
         nothing
     end
     outcome_count = _outcome_count(workspace, plan)
@@ -1001,16 +1422,16 @@ function _initialize_prefix_cache!(
     return root
 end
 
-function _build_prefix_child!(
-    sampler::BornSampler{TangentMode},
-    workspace::TangentSamplingWorkspace,
+function _build_prefix_child_with_completion!(
+    sampler::BornSampler{M},
+    workspace::TangentSamplingWorkspace{M},
     current_cache::PrefixCache{T,R,F,TangentBranchBundle{F}},
     next_cache::PrefixCache{T,R,F,TangentBranchBundle{F}},
     parent::PrefixNode,
     selected::Int,
     site::Int,
-) where {T,R,F}
-    plan = sampler.plans[site]::TangentSitePlan
+    next_completion::TangentCompletionMetric,
+) where {M<:TangentSamplingMode,T,R,F}
     qselected = parent.q[selected]
     z = _total_weight(parent.q, length(parent.q), site)
     child_log_probability =
@@ -1019,12 +1440,17 @@ function _build_prefix_child!(
 
     raw_factor = _take_tangent_branch!(current_cache, parent, selected)
     factor = _advance_built_tangent_factor!(raw_factor, qselected)
-    next_plan = sampler.plans[site + 1]::TangentSitePlan
+    next_plan = sampler.plans[site + 1]
     extendable = site + 1 < length(sampler.plans)
     factors = if extendable
-        _compute_weights_and_factors!(workspace, factor, next_plan)
+        _compute_weights_and_factors!(
+            workspace,
+            factor,
+            next_plan,
+            next_completion,
+        )
     else
-        _compute_weights!(workspace, factor, next_plan)
+        _compute_weights!(workspace, factor, next_plan, next_completion)
         nothing
     end
     outcome_count = _outcome_count(workspace, next_plan)
@@ -1046,16 +1472,73 @@ function _build_prefix_child!(
     return child
 end
 
-"""
-    bornsample!(rng, tangent::FiniteMPSTangents.TangentMPS;
-                left_boundary=nothing, purified=true)
+# The scalar API uses the same batch-owned completion lifecycle and numerical
+# branch builders. It stays serial, like the ordinary scalar API; all batched
+# calls continue through the one shared prefix-tree/worker scheduler.
+function bornsample!(
+    rng::Random.AbstractRNG,
+    sampler::BornSampler{M},
+    config::AbstractVector{Int},
+) where {M<:TangentSamplingMode}
+    Base.require_one_based_indexing(config)
+    expected_length = _configuration_length(sampler)
+    length(config) == expected_length || throw(DimensionMismatch(
+        "config has length $(length(config)); expected $expected_length",
+    ))
 
-Compile the tangent vector's naturally isomorphic Hilbert-space state and draw
-one physical snapshot.  Local MPO purification legs and a persistent tangent
-symmetry leg are traced.  The input tangent and its base point are not mutated.
-`purified=false` is unsupported because these auxiliary legs are not sampling
-outcomes in the tangent-state interface.
-"""
+    workspace = first(sampler.workspaces)
+    factor = sampler.initial_factor
+    log_probability = zero(eltype(workspace.q))
+    run = _begin_sampling_run(sampler; disk=false)
+    try
+        chain_length = length(sampler.plans)
+        for layer in eachindex(sampler.plans)
+            plan = sampler.plans[layer]
+            completion = _take_sampling_completion!(run, layer)
+            factors = _compute_weights_and_factors!(
+                workspace,
+                factor,
+                plan,
+                completion,
+            )
+            outcome_count = _outcome_count(workspace, plan)
+            z = _total_weight(workspace.q, outcome_count, layer)
+            selected = _draw_outcome(rng, workspace.q, z, outcome_count)
+            qselected = workspace.q[selected]
+            _store_outcome!(
+                workspace,
+                config,
+                layer,
+                chain_length,
+                plan,
+                selected,
+            )
+            log_probability += log(qselected) - log(z)
+            if layer < chain_length
+                factor = _advance_built_tangent_factor!(
+                    factors[selected],
+                    qselected,
+                )
+            end
+        end
+    finally
+        _cleanup_sampling_run!(run)
+    end
+    return log_probability
+end
+
+function bornsample!(
+    rng::Random.AbstractRNG,
+    sampler::BornSampler{M},
+) where {M<:TangentSamplingMode}
+    configuration = Vector{Int}(undef, _configuration_length(sampler))
+    log_probability = bornsample!(rng, sampler, configuration)
+    return (
+        configuration=configuration,
+        log_probability=log_probability,
+    )
+end
+
 function bornsample!(
     rng::Random.AbstractRNG,
     state::FiniteMPSTangents.TangentMPS;

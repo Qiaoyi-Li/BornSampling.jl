@@ -29,12 +29,20 @@ layout.
 
 For a `FiniteMPSTangents.TangentMPS`, the sampler represents the coherent sum
 of all one-site insertion terms under the tangent-space/Hilbert-space
-isomorphism. Local MPO purification legs and the persistent tangent symmetry
-leg are traced, and the configuration again contains `L` physical indices.
-The tangent and its base point are not mutated or canonicalized;
-`purified=false` is therefore unsupported for this interface. The compiled
-sampler retains views into their tensor blocks, so they must not be modified
-while it is in use.
+isomorphism. With `purified=true`, local MPO purification legs and the
+persistent global tangent-symmetry leg are traced, and the configuration
+contains `L` physical indices. With `purified=false`, all existing local
+purification legs and the one global leg are sampled. The layout is
+
+```text
+x₁, …, xL [, y₁, …, yL] [, q].
+```
+
+The `y` group is present when any base tensor is rank four; rank-three sites in
+such a mixed base contribute `yᵢ = 1`. The final `q` entry is present only when
+the tangent tensors carry the extra persistent leg. The tangent and its base
+point are not mutated or canonicalized. The compiled sampler retains views
+into their tensor blocks, so they must not be modified while it is in use.
 
 `left_boundary` accepts a pure boundary vector for a supported nontrivial left
 boundary. Sampler construction normalizes that vector, compiles the local
@@ -80,6 +88,11 @@ chooses the number of Julia worker tasks. Shots advance one site at a time and
 are dynamically assigned within each layer. With `disk=true`, `maxsize`
 chooses how many environments remain resident in each prefix frontier; the
 adjacent current and next frontiers coexist while a layer is being completed.
+For a tangent sampler, `disk=true` also gives its once-per-batch right suffix
+sweep a separate consume-once disk store. The first active completion stays in
+memory; each later suffix environment is loaded once, shared read-only by all
+workers at a layer, and deleted after the layer barrier. This suffix policy is
+controlled only by `disk`; `maxsize` still applies solely to prefix frontiers.
 
 An ordinary probability is obtained when needed with
 `exp(shot.log_probability)` or `exp.(batch.log_probability)`.

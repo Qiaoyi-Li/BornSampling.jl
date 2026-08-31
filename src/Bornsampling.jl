@@ -13,6 +13,7 @@ export bornsample!
 
 include("contraction.jl")
 include("tangent_contraction.jl")
+include("tangent_completion_store.jl")
 include("prefix_cache.jl")
 include("sampler.jl")
 include("tangent_sampler.jl")
