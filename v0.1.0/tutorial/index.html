@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Tutorial · BornSampling.jl</title><meta name="title" content="Tutorial · BornSampling.jl"/><meta property="og:title" content="Tutorial · BornSampling.jl"/><meta property="twitter:title" content="Tutorial · BornSampling.jl"/><meta name="description" content="Documentation for BornSampling.jl."/><meta property="og:description" content="Documentation for BornSampling.jl."/><meta property="twitter:description" content="Documentation for BornSampling.jl."/><meta property="og:url" content="https://Qiaoyi-Li.github.io/BornSampling.jl/tutorial/"/><meta property="twitter:url" content="https://Qiaoyi-Li.github.io/BornSampling.jl/tutorial/"/><link rel="canonical" href="https://Qiaoyi-Li.github.io/BornSampling.jl/tutorial/"/><script data-outdated-warner src="../assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.63.2/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL=".."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="../assets/documenter.js"></script><script src="../search_index.js"></script><script src="../siteinfo.js"></script><script src="../../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="../assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="../assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href="../">BornSampling.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li><a class="tocitem" href="../">Home</a></li><li class="is-active"><a class="tocitem" href>Tutorial</a><ul class="internal"><li><a class="tocitem" href="#tutorial_setup"><span>Shared Hubbard setup</span></a></li><li><a class="tocitem" href="#tutorial_mps"><span>Ground-state MPS sampling</span></a></li><li><a class="tocitem" href="#tutorial_mpo"><span>Thermal purification MPO sampling</span></a></li></ul></li><li><a class="tocitem" href="../implementation/">Implementation</a></li><li><a class="tocitem" href="../api/">API</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li class="is-active"><a href>Tutorial</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>Tutorial</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/Qiaoyi-Li/BornSampling.jl" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="tutorial"><a class="docs-heading-anchor" href="#tutorial">Tutorial</a><a id="tutorial-1"></a><a class="docs-heading-anchor-permalink" href="#tutorial" title="Permalink"></a></h1><p>This tutorial samples a half-filled Hubbard chain from a ground-state MPS and a thermal purification MPO. The MPS produces physical-basis snapshots; the MPO demonstrates both the exact physical marginal and the joint physical–purification distribution.</p><p>The examples use a chain of length <span>$L=16$</span>, <span>$U=8$</span>, <span>$\mu=U/2$</span>, and bond dimension <span>$D=512$</span>. Documentation builds execute every block online, so this compact system and bond dimension keep the build practical. The calculations demonstrate the workflow and do not guarantee bond-dimension or sweep convergence.</p><h2 id="tutorial_setup"><a class="docs-heading-anchor" href="#tutorial_setup">Shared Hubbard setup</a><a id="tutorial_setup-1"></a><a class="docs-heading-anchor-permalink" href="#tutorial_setup" title="Permalink"></a></h2><p>The Hamiltonian is</p><p class="math-container">\[H = -\sum_{\langle i,j\rangle,\sigma}
+\left(c^\dagger_{i\sigma}c_{j\sigma} + \mathrm{h.c.}\right)
++ U\sum_i n_{i\uparrow}n_{i\downarrow} - \mu\sum_i n_i.\]</p><p>The charge U(1) and spin SU(2) representation comes from <code>BornSampling.FiniteMPS</code>; reduced TensorKit spaces are available through <code>BornSampling.TK</code>. Model construction, state preparation, direct contraction, and plotting live in <code>tutorial_helpers.jl</code>, leaving the sampling path visible here.</p><pre><code class="language-julia hljs">L = 16
+U = 8.0
+mu = U / 2
+D = 512
+Ns_rankone = 1000
+Ns_traced = 100
+traced_batch_count = 10
+ntasks = Threads.nthreads()
+
+hamiltonian = hubbard_hamiltonian(L; U, mu)
+sz_lookup = hubbard_sz_lookup()</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">4-element Vector{Float64}:
+  0.5
+ -0.5
+  0.0
+  0.0</code></pre><p>For every curve, pairs at the same integer separation <span>$r=j-i$</span> are averaged inside each shot. Those per-shot radial values determine the sample mean and its standard error.</p><h2 id="tutorial_mps"><a class="docs-heading-anchor" href="#tutorial_mps">Ground-state MPS sampling</a><a id="tutorial_mps-1"></a><a class="docs-heading-anchor-permalink" href="#tutorial_mps" title="Permalink"></a></h2><p>At half filling the total U(1) charge is zero in the particle–hole-centered convention. A spin-singlet boundary initializes the MPS, and CBE 1-DMRG prepares the state at bond-dimension ceiling <span>$D$</span>.</p><pre><code class="language-julia hljs">ground_state, ground_result = prepare_ground_state(
+    hamiltonian;
+    nsites=L,
+    D,
+    seed=3101,
+)
+ground_result</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">(sweeps = 3, final_energy = -69.03713409165384)</code></pre><p><code>BornSampling.BornSampler</code> compiles the canonical-basis contraction plans. The batched call returns one configuration per matrix column together with its log probability.</p><pre><code class="language-julia hljs">ground_direct = direct_szsz_by_distance(ground_state; ntasks)
+
+ground_sampler = BornSampling.BornSampler(ground_state)
+ground_batch = BornSampling.bornsample!(
+    Random.MersenneTwister(3102),
+    ground_sampler,
+    Ns_rankone;
+    ntasks,
+)
+
+ground_mean, ground_se = sampled_szsz_by_distance(
+    ground_batch.configuration,
+    sz_lookup,
+)
+
+plot_szsz_comparison(
+    ground_direct,
+    ((
+        mean=ground_mean,
+        standard_error=ground_se,
+        color=:royalblue,
+        label=&quot;MPS samples&quot;,
+    ),);
+    direct_label=&quot;Ground-state expectation&quot;,
+    filename=&quot;tutorial_hubbard_ground_state_szsz.png&quot;,
+)</code></pre><p><img src="../figures/tutorial_hubbard_ground_state_szsz.png" alt/></p><p>The sample mean estimates the diagonal spin correlation, and the whiskers show its standard error. The Hamiltonian is retained for thermal preparation.</p><pre><code class="language-julia hljs">ground_batch = nothing
+ground_sampler = nothing
+ground_state = nothing
+GC.gc()</code></pre><h2 id="tutorial_mpo"><a class="docs-heading-anchor" href="#tutorial_mpo">Thermal purification MPO sampling</a><a id="tutorial_mpo-1"></a><a class="docs-heading-anchor-permalink" href="#tutorial_mpo" title="Permalink"></a></h2><p>For a thermal factor <span>$|X\rangle$</span>, <code>purified=true</code> draws the exact physical marginal</p><p class="math-container">\[p(x) = \frac{\sum_y |X(x,y)|^2}{\langle X|X\rangle},\]</p><p>while <code>purified=false</code> draws the joint distribution</p><p class="math-container">\[p(x,y) = \frac{|X(x,y)|^2}{\langle X|X\rangle}.\]</p><p>Selecting the physical part of a joint sample gives the same marginal <span>$p(x)$</span>. SETTN initializes the thermal factor at high temperature, and CBE 1-TDVP evolves it on an exponential grid to <span>$\beta=1$</span>.</p><pre><code class="language-julia hljs">factor, beta = prepare_thermal_factor(hamiltonian; D)
+beta</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">1.0</code></pre><h3 id="Exact-physical-marginal"><a class="docs-heading-anchor" href="#Exact-physical-marginal">Exact physical marginal</a><a id="Exact-physical-marginal-1"></a><a class="docs-heading-anchor-permalink" href="#Exact-physical-marginal" title="Permalink"></a></h3><p>The direct thermal contraction provides the reference curve. The traced sampler then produces physical configurations from the exact marginal. Running the traced shots as several small batches trades lower peak prefix-bank memory for less parallel work and prefix reuse per call.</p><pre><code class="language-julia hljs">thermal_direct = direct_szsz_by_distance(factor; ntasks)
+
+traced_state = deepcopy(factor)
+traced_sampler = BornSampling.BornSampler(traced_state; purified=true)
+traced_rng = Random.MersenneTwister(3201)
+traced_configuration = Matrix{Int}(undef, L, Ns_traced)
+traced_batch_size = Ns_traced ÷ traced_batch_count
+
+for batch in 1:traced_batch_count
+    columns = ((batch - 1) * traced_batch_size + 1):(batch * traced_batch_size)
+    result = BornSampling.bornsample!(
+        traced_rng,
+        traced_sampler,
+        traced_batch_size;
+        ntasks,
+    )
+    traced_configuration[:, columns] .= result.configuration
+end
+
+traced_mean, traced_se = sampled_szsz_by_distance(
+    traced_configuration,
+    sz_lookup,
+)
+
+traced_configuration = nothing
+traced_sampler = nothing
+traced_state = nothing
+GC.gc()</code></pre><h3 id="Joint-physical–purification-samples"><a class="docs-heading-anchor" href="#Joint-physical–purification-samples">Joint physical–purification samples</a><a id="Joint-physical–purification-samples-1"></a><a class="docs-heading-anchor-permalink" href="#Joint-physical–purification-samples" title="Permalink"></a></h3><p>Joint sampling returns a <span>$2L\times N_s$</span> configuration matrix ordered as <span>$[x_1,\ldots,x_L,y_1,\ldots,y_L]$</span>. The physical rows feed the same diagonal observable estimator.</p><pre><code class="language-julia hljs">joint_sampler = BornSampling.BornSampler(factor; purified=false)
+joint_batch = BornSampling.bornsample!(
+    Random.MersenneTwister(3202),
+    joint_sampler,
+    Ns_rankone;
+    ntasks,
+)
+joint_physical_configuration = @view joint_batch.configuration[1:L, :]
+joint_mean, joint_se = sampled_szsz_by_distance(
+    joint_physical_configuration,
+    sz_lookup,
+)
+
+joint_summary = (;
+    joint_configuration_size=size(joint_batch.configuration),
+    samples=Ns_rankone,
+)
+joint_summary</code></pre><pre class="documenter-example-output"><code class="nohighlight hljs ansi">(joint_configuration_size = (32, 1000), samples = 1000)</code></pre><p>The direct contraction, traced marginal samples, and physical part of the joint samples form the three thermal comparison curves.</p><pre><code class="language-julia hljs">plot_szsz_comparison(
+    thermal_direct,
+    (
+        (
+            mean=traced_mean,
+            standard_error=traced_se,
+            color=:royalblue,
+            label=&quot;Trace (×$(Ns_traced))&quot;,
+        ),
+        (
+            mean=joint_mean,
+            standard_error=joint_se,
+            color=:darkorange,
+            label=&quot;Joint (×$(Ns_rankone))&quot;,
+        ),
+    );
+    direct_label=&quot;Thermal expectation&quot;,
+    filename=&quot;tutorial_hubbard_thermal_szsz.png&quot;,
+)</code></pre><p><img src="../figures/tutorial_hubbard_thermal_szsz.png" alt/></p></article><nav class="docs-footer"><a class="docs-footer-prevpage" href="../">« Home</a><a class="docs-footer-nextpage" href="../implementation/">Implementation »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.19.0 on <span class="colophon-date" title="Thursday 3 September 2026 18:20">Thursday 3 September 2026</span>. Using Julia version 1.11.9.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
