@@ -45,22 +45,6 @@ Constructing a sampler canonicalizes its state in place and retains compiled
 views of the local tensors. Reuse that sampler for repeated shots and treat its
 state as sampling-owned afterward.
 
-`FiniteMPSTangents.TangentMPS` uses the same `BornSampler` and `bornsample!`
-entry points. Its coherent single-insertion sum is sampled as a Hilbert-space
-state. With `purified=true`, local MPO purification legs and a persistent
-global tangent-symmetry leg are traced. With `purified=false`, the local legs
-are sampled and the global leg is sampled once; joint output is ordered
-`[x; y; q]`, with absent groups omitted. Constructing this sampler does not
-mutate the tangent or its base, but the compiled sampler retains tensor-block
-views, so treat both as sampling-owned afterward.
-
-Each nonempty tangent batch builds one right-to-left suffix-environment sweep
-and shares it across all shots in that call. With `disk=true`, the first active
-completion stays in memory; the remaining suffix environments are written,
-loaded once per layer, and deleted as the batch moves left to right. This rule
-is independent of `maxsize`, which continues to control only the sampled-prefix
-frontier cache.
-
 ## Learn more
 
 - [Tutorial](https://Qiaoyi-Li.github.io/BornSampling.jl/dev/tutorial/)
