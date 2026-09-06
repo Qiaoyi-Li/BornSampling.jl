@@ -1,7 +1,7 @@
 name = "BornSampling"
 uuid = "024a6725-e534-4d5f-9c4f-99bb86a2a22e"
 authors = ["Qiaoyi Li <liqiaoyi@itp.ac.cn>"]
-version = "0.1.1"
+version = "0.2.0"
 
 [deps]
 FiniteMPS = "6b572690-f317-4dad-a5fe-5fe73a0b7d42"
