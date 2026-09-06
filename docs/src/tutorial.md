@@ -1,15 +1,14 @@
 # [Tutorial](@id tutorial)
 
-This tutorial samples a half-filled Hubbard chain from a ground-state MPS and
-a thermal purification MPO. The MPS produces physical-basis snapshots; the
-MPO demonstrates both the exact physical marginal and the joint
-physical--purification distribution.
+This tutorial demonstrates Born sampling on a half-filled Fermi-Hubbard chain
+using a ground-state MPS and a thermal purification MPO. We sample physical
+configurations from the ground state, and explore both the exact physical
+marginal and the joint physical--purification distribution from the thermal
+state.
 
-The examples use a chain of length ``L=16``, ``U=8``, ``\mu=U/2``, and bond
-dimension ``D=512``. Documentation builds execute every block online, so this
-compact system and bond dimension keep the build practical. The calculations
-demonstrate the workflow and do not guarantee bond-dimension or sweep
-convergence.
+The example uses a chain of length ``L=16``, ``U=8``, ``\mu=U/2``, and bond
+dimension ``D=512``. The calculations demonstrate the workflow rather than full
+numerical convergence.
 
 ```@setup HubbardTutorial
 import BornSampling
@@ -39,11 +38,9 @@ H = -\sum_{\langle i,j\rangle,\sigma}
 + U\sum_i n_{i\uparrow}n_{i\downarrow} - \mu\sum_i n_i.
 ```
 
-The charge U(1) and spin SU(2) representation comes from
-`BornSampling.FiniteMPS`; reduced TensorKit spaces are available through
-`BornSampling.TK`. Model construction, state preparation, direct contraction,
-and plotting live in `tutorial_helpers.jl`, leaving the sampling path visible
-here.
+The model uses the charge U(1) and spin SU(2) representations from
+`FiniteMPS.jl`. Helper functions for state preparation, exact contraction, and
+plotting are defined in `tutorial_helpers.jl`.
 
 ```@example HubbardTutorial
 L = 16
@@ -59,15 +56,14 @@ hamiltonian = hubbard_hamiltonian(L; U, mu)
 sz_lookup = hubbard_sz_lookup()
 ```
 
-For every curve, pairs at the same integer separation ``r=j-i`` are averaged
-inside each shot. Those per-shot radial values determine the sample mean and
-its standard error.
+Spin correlations at separation ``r = |i - j|`` are averaged within each shot
+to compute the sample mean and standard error.
 
 ## [Ground-state MPS sampling](@id tutorial_mps)
 
-At half filling the total U(1) charge is zero in the particle--hole-centered
-convention. A spin-singlet boundary initializes the MPS, and CBE 1-DMRG
-prepares the state at bond-dimension ceiling ``D``.
+At half filling, total U(1) charge is zero in the particle--hole-symmetric
+convention. The ground state is prepared via CBE 1-DMRG with bond dimension
+``D``.
 
 ```@example HubbardTutorial
 ground_state, ground_result = prepare_ground_state(
@@ -79,9 +75,9 @@ ground_state, ground_result = prepare_ground_state(
 ground_result
 ```
 
-`BornSampling.BornSampler` compiles the canonical-basis contraction plans.
-The batched call returns one configuration per matrix column together with its
-log probability. The default `purified=true` traces the left boundary.
+`BornSampler` compiles the contraction plans. Batched sampling returns
+configurations as matrix columns along with their log probabilities. By
+default, `purified=true` traces the boundary.
 
 ```@example HubbardTutorial
 ground_direct = direct_szsz_by_distance(ground_state; ntasks)
@@ -114,8 +110,8 @@ plot_szsz_comparison(
 
 ![](./figures/tutorial_hubbard_ground_state_szsz.png)
 
-The sample mean estimates the diagonal spin correlation, and the whiskers show
-its standard error. The Hamiltonian is retained for thermal preparation.
+The sample mean estimates the spin correlation function, with error bars
+indicating the standard error.
 
 ```@example HubbardTutorial
 ground_batch = nothing
@@ -126,22 +122,22 @@ GC.gc()
 
 ## [Thermal purification MPO sampling](@id tutorial_mpo)
 
-For a thermal factor ``|X\rangle``, `purified=true` traces the left boundary
-``b`` and local purification legs to draw the exact physical marginal
+For a purified thermal state ``|X\rangle``, setting `purified=true` traces the
+boundary and local purification legs to sample from the exact physical marginal:
 
 ```math
 p(x) = \frac{\sum_{y,b} |X(b,x,y)|^2}{\langle X|X\rangle},
 ```
 
-while `purified=false` draws the joint distribution
+while `purified=false` samples the joint distribution:
 
 ```math
 p(x,y,b) = \frac{|X(b,x,y)|^2}{\langle X|X\rangle}.
 ```
 
-Selecting the physical part of a joint sample gives the same marginal
-``p(x)``. SETTN initializes the thermal factor at high temperature, and CBE
-1-TDVP evolves it on an exponential grid to ``\beta=1``.
+Discarding purification and boundary indices from joint samples yields the same
+physical marginal ``p(x)``. The thermal state is prepared at ``\beta=1`` using
+SETTN and CBE 1-TDVP.
 
 ```@example HubbardTutorial
 factor, beta = prepare_thermal_factor(hamiltonian; D)
@@ -150,10 +146,9 @@ beta
 
 ### Exact physical marginal
 
-The direct thermal contraction provides the reference curve. The traced
-sampler then produces physical configurations from the exact marginal.
-Running the traced shots as several small batches trades lower peak
-prefix-bank memory for less parallel work and prefix reuse per call.
+We compute the exact expectation value as a reference, then sample physical
+configurations from the traced marginal distribution. Here, shots are drawn in
+smaller batches to keep peak memory low.
 
 ```@example HubbardTutorial
 thermal_direct = direct_szsz_by_distance(factor; ntasks)
@@ -189,8 +184,9 @@ GC.gc()
 ### Joint physical--purification samples
 
 Joint sampling returns a ``(2L+1)\times N_s`` configuration matrix ordered as
-``[x_1,\ldots,x_L,y_1,\ldots,y_L,b]``, with ``b=1`` for this singlet boundary.
-The first ``L`` physical rows feed the same diagonal observable estimator.
+``[x_1,\ldots,x_L,y_1,\ldots,y_L,b]``, with ``b=1`` for the singlet boundary.
+The first ``L`` rows correspond to physical indices and are passed directly to
+the correlation estimator.
 
 ```@example HubbardTutorial
 joint_sampler = BornSampling.BornSampler(factor; purified=false)
@@ -213,8 +209,8 @@ joint_summary = (;
 joint_summary
 ```
 
-The direct contraction, traced marginal samples, and physical part of the
-joint samples form the three thermal comparison curves.
+We compare the exact thermal expectation against both traced sampling and the
+physical marginal of joint sampling.
 
 ```@example HubbardTutorial
 plot_szsz_comparison(

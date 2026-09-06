@@ -4,11 +4,10 @@
 CurrentModule = BornSampling
 ```
 
-This repository is a downstream package of
-[`FiniteMPS.jl`](https://github.com/Qiaoyi-Li/FiniteMPS.jl) for drawing
-canonical-basis snapshots of MPS and MPO according to their Born probabilities.
-It outputs the sampled configurations and their log probabilities for
-subsequent statistical analysis.
+BornSampling draws canonical-basis snapshots of MPS and MPO states according to
+their Born probabilities, based on
+[`FiniteMPS.jl`](https://github.com/Qiaoyi-Li/FiniteMPS.jl). It returns the
+sampled configurations alongside their log probabilities.
 
 ## First sample
 
@@ -30,12 +29,11 @@ shot = BornSampling.bornsample!(rng, sampler)
 )
 ```
 
-Sampler construction canonicalizes `state` in place. The
-compiled sampler then owns that canonicalized tensor data and can be reused for
-many shots.
+Constructing a `BornSampler` canonicalizes `state` in place and compiles
+contraction plans that can be reused across repeated sampling calls.
 
-Continue with the [Tutorial](@ref tutorial), [Implementation](@ref
-implementation), and [Public API](@ref public_api).
+See the [Tutorial](@ref tutorial), [Implementation](@ref implementation), and
+[Public API](@ref public_api) for details.
 
 ```@contents
 Pages = ["tutorial.md", "implementation.md", "api.md"]
