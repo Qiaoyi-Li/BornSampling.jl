@@ -19,10 +19,19 @@ struct TangentSitePlan{P} <: AbstractSitePlan
     purification_row::Int
 end
 
+"""Joint root that draws global q after b and stores q in the final output row."""
 struct TangentGlobalQPlan{B} <: AbstractSitePlan
     symmetry_basis::B
     output_row::Int
 end
+
+"""First joint root: draw b from the full left basis and store it after x and y."""
+struct TangentBoundaryPlan{B} <: AbstractSitePlan
+    boundary_basis::B
+    output_row::Int
+end
+
+const TangentRootPlan = Union{TangentBoundaryPlan,TangentGlobalQPlan}
 
 """One deterministic sparse matrix over pairs of residual-sector blocks."""
 struct TangentBlockMatrix{T}
@@ -59,7 +68,11 @@ struct TangentCompletionMetric{T}
     uninserted::Vector{TangentBlockMatrix{T}}
 end
 
-"""A sampled tangent prefix in one common purification-history factor basis."""
+"""
+A sampled tangent prefix in one common purification-history factor basis.
+The history initially spans the full left boundary; a joint b root selects
+one boundary column before the local sites are sampled.
+"""
 struct TangentPrefixFactor{T,M<:Matrix{T},A<:Array{T,3},I<:Vector{Int}}
     uninserted::M
     inserted::A
@@ -88,10 +101,11 @@ function TangentBranchBundle(factors::AbstractVector{F}) where {F}
     return TangentBranchBundle{F}(owned)
 end
 
+"""One run's pending site metrics and the metric retained for its initial layers."""
 mutable struct TangentSamplingRun{C,S}
     store::S
     root_completion::Union{Nothing,C}
-    has_global_q_root::Bool
+    root_count::Int
 end
 
 @inline _tensor_rank(::FiniteMPS.MPSTensor{R}) where {R} = R
@@ -339,6 +353,9 @@ function _allocate_tangent_workspace(
         step.physical.fulldim * local_dimension
     end
     has_global_q_root && (qmax = max(qmax, symmetry_dimension))
+    if M === JointTangentMode
+        qmax = max(qmax, first(local_plans).left.left.fulldim)
+    end
     scratch = _allocate_scratch(S, T, maximum_scratch)
     return TangentSamplingWorkspace{M,T,R,typeof(scratch)}(
         zeros(R, qmax),
@@ -642,26 +659,24 @@ function _right_boundary_metric(::Type{T}, step::TangentLocalPlan) where {T}
     )
 end
 
+"""Initialize separate full-boundary history columns with U = I/√dim(b) and V = 0."""
 function _build_initial_tangent_factor(
     ::Type{T},
-    boundary::Vector{T},
     step::TangentLocalPlan,
 ) where {T}
     full_left = step.left.left
     residual_left = step.left.residual_left
-    length(full_left.sectors) == 1 && only(full_left.multiplicities) == 1 ||
-        throw(ArgumentError(
-            "the left virtual space must have one original sector with reduced " *
-            "multiplicity one",
-        ))
+    _validate_left_multiplet(full_left)
     dimension = _residual_dimension(residual_left)
-    uninserted = zeros(T, dimension, 1)
+    boundary_dimension = full_left.fulldim
+    uninserted = zeros(T, dimension, boundary_dimension)
     rows = only(residual_left.embeddings).rows
-    @inbounds for row in eachindex(boundary)
-        uninserted[rows[row], 1] = boundary[row]
+    scale = inv(sqrt(convert(T, boundary_dimension)))
+    @inbounds for column in 1:boundary_dimension
+        uninserted[rows[column], column] = scale
     end
     symmetry_dimension = length(step.symmetry_basis)
-    inserted = zeros(T, dimension, symmetry_dimension, 1)
+    inserted = zeros(T, dimension, symmetry_dimension, boundary_dimension)
     return TangentPrefixFactor(
         uninserted,
         inserted,
@@ -678,12 +693,21 @@ function _build_tangent_plans(
     L = length(local_plans)
     joint = M === JointTangentMode
     has_q_root = joint && has_symmetry
-    layers = Vector{AbstractSitePlan}(undef, L + Int(has_q_root))
-    offset = Int(has_q_root)
+    offset = Int(joint) + Int(has_q_root)
+    layers = Vector{AbstractSitePlan}(undef, L + offset)
     purification_offset = joint && operator_like ? L : 0
+    boundary_row = L + purification_offset + 1
+    if joint
+        layers[1] = TangentBoundaryPlan(
+            _basis_info(first(local_plans).left.left),
+            boundary_row,
+        )
+    end
     if has_q_root
-        qrow = L + purification_offset + 1
-        layers[1] = TangentGlobalQPlan(first(local_plans).symmetry_basis, qrow)
+        layers[2] = TangentGlobalQPlan(
+            first(local_plans).symmetry_basis,
+            boundary_row + 1,
+        )
     end
     for site in 1:L
         purification_row = purification_offset == 0 ? 0 : L + site
@@ -697,25 +721,30 @@ function _build_tangent_plans(
 end
 
 """
-    BornSampler(tangent::FiniteMPSTangents.TangentMPS;
-                left_boundary=nothing, purified=true)
+    BornSampler(tangent::FiniteMPSTangents.TangentMPS; purified=true)
 
 Compile the Hilbert-space state represented by a finite-MPS tangent vector.
 The state is the coherent sum over all single-insertion sites. Construction
 compiles symmetry-aware local routes, while every nonempty sampling batch owns
 one right-to-left completion sweep and releases it at batch completion.
 
-With `purified=true`, all local purification indices and persistent global q
-are traced. With `purified=false`, local purification indices are sampled and
-a present q is sampled once at a synthetic root. Joint output is `[x; y; q]`,
-omitting absent groups. Rank-three sites in a mixed operator-valued base emit
-the synthetic local value `y=1`.
+With `purified=true`, the full left boundary, local purification legs, and
+global q are traced, returning `L` physical indices. With `purified=false`,
+joint output is `[x; optional y; b; optional q]`: b is always included, y has
+one entry per site when any base tensor has rank four, and q is included when
+the tangent carries the extra global leg. Rank-three sites record `y=0` in a
+present y group; actual one-dimensional legs record `1`. Joint sampling draws
+b, then q when present, then the local site outcomes.
 """
 function BornSampler(
     state::FiniteMPSTangents.TangentMPS;
     left_boundary=nothing,
     purified::Bool=true,
 )
+    left_boundary === nothing || throw(ArgumentError(
+        "left_boundary is no longer supported; purified=true traces the full " *
+        "left boundary and purified=false samples it",
+    ))
     layout = _validate_tangent_tensors(state)
     sector_type = TK.sectortype(first(state.base.Al).A)
     S = _style_type(first(state.base.Al))
@@ -759,16 +788,10 @@ function BornSampler(
         Rprob,
         S,
         local_plans,
-        first(plans) isa TangentGlobalQPlan,
-    )
-    boundary = _prepare_left_boundary(
-        left_boundary,
-        T,
-        first(local_plans).left.left.fulldim,
+        !purified && layout.has_symmetry,
     )
     initial_factor = _build_initial_tangent_factor(
         T,
-        boundary,
         first(local_plans),
     )
     return BornSampler{
@@ -785,10 +808,13 @@ function BornSampler(
     )
 end
 
+@inline _tangent_root_count(sampler) =
+    count(plan -> plan isa TangentRootPlan, sampler.plans)
+
 @inline function _tangent_local_steps(sampler::BornSampler{M}) where {
     M<:TangentSamplingMode,
 }
-    offset = first(sampler.plans) isa TangentGlobalQPlan ? 1 : 0
+    offset = _tangent_root_count(sampler)
     return map((offset + 1):length(sampler.plans)) do layer
         (sampler.plans[layer]::TangentSitePlan).step
     end
@@ -807,16 +833,13 @@ function _begin_sampling_run(
     C = typeof(completion)
     store = TangentCompletionStore{C}(length(steps); disk=disk)
     try
-        has_global_q_root = first(sampler.plans) isa TangentGlobalQPlan
+        root_count = _tangent_root_count(sampler)
         for site in reverse(eachindex(steps))
-            # The first sampling layer stays in RAM. Without a synthetic q
-            # root this is E₁ itself; with a q root, E₁ is needed by layer 2
-            # and is therefore stored while the fully retreated root stays in
-            # RAM.
-            if site > 1 || has_global_q_root
+            # Joint b and optional q roots share the full-chain metric in RAM.
+            # Their site completions are stored by local index. Traced sampling
+            # keeps the first site's completion in RAM and stores sites 2:L.
+            if site > 1 || root_count > 0
                 _put_completion!(store, site, completion)
-            end
-            if site > 1 || has_global_q_root
                 completion = _retreat_completion_metric(
                     steps[site],
                     completion,
@@ -827,7 +850,7 @@ function _begin_sampling_run(
         return TangentSamplingRun{C,typeof(store)}(
             store,
             completion,
-            has_global_q_root,
+            root_count,
         )
     catch
         _cleanup_completion_store!(store)
@@ -836,12 +859,13 @@ function _begin_sampling_run(
 end
 
 function _take_sampling_completion!(run::TangentSamplingRun{C}, layer::Int) where {C}
-    if layer == 1
+    last_root_layer = max(1, run.root_count)
+    if layer <= last_root_layer
         completion = run.root_completion
-        run.root_completion = nothing
+        layer == last_root_layer && (run.root_completion = nothing)
         return completion::C
     end
-    site = run.has_global_q_root ? layer - 1 : layer
+    site = layer - run.root_count
     return _take_completion!(run.store, site)
 end
 
@@ -1010,6 +1034,25 @@ function _restrict_tangent_symmetry(
     )
 end
 
+function _restrict_tangent_boundary(
+    factor::TangentPrefixFactor{T},
+    selected::Int,
+) where {T}
+    # At the first synthetic root, each history column still labels one
+    # original left-boundary basis state.
+    columns = selected:selected
+    return TangentPrefixFactor(
+        Matrix(view(factor.uninserted, :, columns)),
+        Array{T,3}(view(factor.inserted, :, :, columns)),
+        factor.symmetry_indices,
+    )
+end
+
+@inline _restrict_tangent_root(factor, ::TangentBoundaryPlan, selected::Int) =
+    _restrict_tangent_boundary(factor, selected)
+@inline _restrict_tangent_root(factor, ::TangentGlobalQPlan, selected::Int) =
+    _restrict_tangent_symmetry(factor, selected)
+
 function _tangent_block_bilinear(
     workspace::TangentSamplingWorkspace{M,T},
     bra::AbstractMatrix,
@@ -1107,15 +1150,15 @@ end
 function _compute_weights_and_factors!(
     workspace::TangentSamplingWorkspace{JointTangentMode},
     factor::TangentPrefixFactor,
-    plan::TangentGlobalQPlan,
+    plan::TangentRootPlan,
     completion::TangentCompletionMetric,
 )
-    count = length(plan.symmetry_basis)
+    count = _outcome_count(workspace, plan)
     factors = Vector{typeof(factor)}(undef, count)
-    @inbounds for symmetry_index in 1:count
-        next_factor = _restrict_tangent_symmetry(factor, symmetry_index)
-        factors[symmetry_index] = next_factor
-        workspace.q[symmetry_index] = _tangent_completion_weight(
+    @inbounds for selected in 1:count
+        next_factor = _restrict_tangent_root(factor, plan, selected)
+        factors[selected] = next_factor
+        workspace.q[selected] = _tangent_completion_weight(
             workspace,
             next_factor,
             completion,
@@ -1127,7 +1170,7 @@ end
 function _compute_weights!(
     workspace::TangentSamplingWorkspace,
     factor::TangentPrefixFactor,
-    plan::Union{TangentSitePlan,TangentGlobalQPlan},
+    plan::Union{TangentSitePlan,TangentRootPlan},
     completion::TangentCompletionMetric,
 )
     _compute_weights_and_factors!(workspace, factor, plan, completion)
@@ -1200,10 +1243,15 @@ end
     plan::TangentGlobalQPlan,
 ) = length(plan.symmetry_basis)
 
+@inline _outcome_count(
+    ::TangentSamplingWorkspace{JointTangentMode},
+    plan::TangentBoundaryPlan,
+) = length(plan.boundary_basis)
+
 @inline function _tangent_configuration_length(sampler)
     maximum_row = 0
     for plan in sampler.plans
-        if plan isa TangentGlobalQPlan
+        if plan isa TangentRootPlan
             maximum_row = max(maximum_row, plan.output_row)
         else
             site_plan = plan::TangentSitePlan
@@ -1227,7 +1275,7 @@ end
     configuration::AbstractVector,
     ::Int,
     ::Int,
-    plan::TangentGlobalQPlan,
+    plan::TangentRootPlan,
     selected::Int,
 )
     configuration[plan.output_row] = selected
@@ -1257,7 +1305,8 @@ end
     physical, local_index = _tangent_joint_coordinates(plan, selected)
     configuration[plan.physical_row] = physical
     iszero(plan.purification_row) ||
-        (configuration[plan.purification_row] = local_index)
+        (configuration[plan.purification_row] =
+            plan.step.left isa SitePlan{3} ? 0 : local_index)
     return nothing
 end
 
@@ -1267,7 +1316,7 @@ end
     ::Int,
     ::Int,
     shot::Int,
-    plan::TangentGlobalQPlan,
+    plan::TangentRootPlan,
     selected::Int,
 )
     configuration[plan.output_row, shot] = selected
@@ -1299,7 +1348,8 @@ end
     physical, local_index = _tangent_joint_coordinates(plan, selected)
     configuration[plan.physical_row, shot] = physical
     iszero(plan.purification_row) ||
-        (configuration[plan.purification_row, shot] = local_index)
+        (configuration[plan.purification_row, shot] =
+            plan.step.left isa SitePlan{3} ? 0 : local_index)
     return nothing
 end
 

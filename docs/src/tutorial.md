@@ -81,7 +81,7 @@ ground_result
 
 `BornSampling.BornSampler` compiles the canonical-basis contraction plans.
 The batched call returns one configuration per matrix column together with its
-log probability.
+log probability. The default `purified=true` traces the left boundary.
 
 ```@example HubbardTutorial
 ground_direct = direct_szsz_by_distance(ground_state; ntasks)
@@ -126,17 +126,17 @@ GC.gc()
 
 ## [Thermal purification MPO sampling](@id tutorial_mpo)
 
-For a thermal factor ``|X\rangle``, `purified=true` draws the exact physical
-marginal
+For a thermal factor ``|X\rangle``, `purified=true` traces the left boundary
+``b`` and local purification legs to draw the exact physical marginal
 
 ```math
-p(x) = \frac{\sum_y |X(x,y)|^2}{\langle X|X\rangle},
+p(x) = \frac{\sum_{y,b} |X(b,x,y)|^2}{\langle X|X\rangle},
 ```
 
 while `purified=false` draws the joint distribution
 
 ```math
-p(x,y) = \frac{|X(x,y)|^2}{\langle X|X\rangle}.
+p(x,y,b) = \frac{|X(b,x,y)|^2}{\langle X|X\rangle}.
 ```
 
 Selecting the physical part of a joint sample gives the same marginal
@@ -188,9 +188,9 @@ GC.gc()
 
 ### Joint physical--purification samples
 
-Joint sampling returns a ``2L\times N_s`` configuration matrix ordered as
-``[x_1,\ldots,x_L,y_1,\ldots,y_L]``. The physical rows feed the same diagonal
-observable estimator.
+Joint sampling returns a ``(2L+1)\times N_s`` configuration matrix ordered as
+``[x_1,\ldots,x_L,y_1,\ldots,y_L,b]``, with ``b=1`` for this singlet boundary.
+The first ``L`` physical rows feed the same diagonal observable estimator.
 
 ```@example HubbardTutorial
 joint_sampler = BornSampling.BornSampler(factor; purified=false)

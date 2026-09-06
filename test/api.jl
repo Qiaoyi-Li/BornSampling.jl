@@ -1,28 +1,35 @@
 @testset "public API and validation" begin
-    # The outer FiniteMPS type selects the sampling semantics. MPS is the
-    # rank-one pure-amplitude path and therefore accepts rank-3 sites only.
+    # The outer FiniteMPS type selects the sampling semantics. An MPS accepts
+    # rank-3 sites only; its left virtual leg is the global purification leg.
     rank4_in_mps = FiniteMPS.MPS(deepcopy(rank4_state().A))
     @test rank4_in_mps isa FiniteMPS.MPS
     @test_throws ArgumentError BS.BornSampler(rank4_in_mps)
 
-    # MPO accepts rank-3 sites as synthetic one-dimensional purification legs.
-    # Its outer mode still controls the public configuration layout.
+    # Rank-3 MPO sites emit y=0 for absent local purification legs. Joint mode
+    # includes the singleton open left boundary as the final entry.
     rank3_source = rank3_state(length=2, bonddim=2)
     traced_rank3_mpo = BS.BornSampler(FiniteMPS.MPO(deepcopy(rank3_source.A)))
     joint_rank3_mpo = BS.BornSampler(
         FiniteMPS.MPO(deepcopy(rank3_source.A)); purified=false,
     )
     traced_rank3_config = Vector{Int}(undef, 2)
-    joint_rank3_config = Vector{Int}(undef, 4)
+    joint_rank3_config = Vector{Int}(undef, 5)
     traced_rank3_logp = BS.bornsample!(
         MersenneTwister(10), traced_rank3_mpo, traced_rank3_config,
     )
     joint_rank3_logp = BS.bornsample!(
         MersenneTwister(10), joint_rank3_mpo, joint_rank3_config,
     )
-    @test joint_rank3_config[1:2] == traced_rank3_config
-    @test joint_rank3_config[3:4] == [1, 1]
-    @test joint_rank3_logp == traced_rank3_logp
+    traced_rank3_reference = normalize_weights!(dense_mpo_boundary_weights(
+        traced_rank3_mpo.state,
+    ))
+    joint_rank3_reference = normalize_weights!(dense_mpo_boundary_weights(
+        joint_rank3_mpo.state; purified=false,
+    ))
+    @test last(joint_rank3_config) == 1
+    @test joint_rank3_config[3:4] == [0, 0]
+    @test exp(traced_rank3_logp) ≈ traced_rank3_reference[Tuple(traced_rank3_config)]
+    @test exp(joint_rank3_logp) ≈ joint_rank3_reference[Tuple(joint_rank3_config)]
 
     state = rank3_state(length=3, bonddim=2)
     sampler = BS.BornSampler(state)
@@ -60,7 +67,9 @@
         purified=false,
     )
     @test joint_direct == joint_expected
-    @test joint_direct.configuration[5:6] == [1, 1]
+    @test length(joint_direct.configuration) == 7
+    @test joint_direct.configuration[5:6] == [0, 0]
+    @test last(joint_direct.configuration) == 1
 
     joint_batch_sampler = BS.BornSampler(deepcopy(joint_source); purified=false)
     joint_batch_expected = BS.bornsample!(
@@ -81,36 +90,43 @@
         maxsize=1,
     )
     @test joint_batch_direct == joint_batch_expected
-    @test size(joint_batch_direct.configuration) == (6, 12)
-    @test all(==(1), @view joint_batch_direct.configuration[5:6, :])
+    @test size(joint_batch_direct.configuration) == (7, 12)
+    @test all(iszero, @view joint_batch_direct.configuration[5:6, :])
+    @test all(==(1), @view joint_batch_direct.configuration[end, :])
 
-    # `purified` does not change MPS semantics.
+    # Joint MPS sampling retains the singleton boundary as the final entry.
     flagged_state = rank3_state(length=2, bonddim=2)
     flagged_sampler = BS.BornSampler(flagged_state; purified=false)
-    @test length(BS.bornsample!(MersenneTwister(13), flagged_sampler).configuration) ==
-          length(flagged_state)
+    flagged_shot = BS.bornsample!(MersenneTwister(13), flagged_sampler)
+    @test length(flagged_shot.configuration) == length(flagged_state) + 1
+    @test last(flagged_shot.configuration) == 1
 
     # A non-Abelian irrep may have full dimension greater than one while its
     # reduced boundary multiplicity D* remains exactly one.
-    left = ComplexF64[3 + 4im, -2im, 1 - im]
-    left_sampler = BS.BornSampler(nontrivial_irrep_left_state(); left_boundary=left)
-    @test vec(convert(Array, left_sampler.initial_factor)) ≈ left / norm(left)
+    # The open left MPO leg is traced by default without selecting a vector.
+    left_mpo() = FiniteMPS.MPO(nontrivial_irrep_left_state().A)
+    left_sampler = BS.BornSampler(left_mpo())
+    initial_array = convert(Array, left_sampler.initial_factor)
+    @test initial_array * adjoint(initial_array) ≈ Matrix{ComplexF64}(I, 3, 3) / 3
     @test norm(left_sampler.initial_factor) ≈ 1
     left_config = Vector{Int}(undef, 2)
     @test isfinite(BS.bornsample!(MersenneTwister(14), left_sampler, left_config))
 
-    @test_throws ArgumentError BS.BornSampler(nontrivial_irrep_left_state())
+    @test_throws ArgumentError BS.BornSampler(
+        left_mpo(); left_boundary=ComplexF64[3 + 4im, -2im, 1 - im],
+    )
     # Reduced boundary multiplicity greater than one is outside the supported
     # contract even when a full pure-state vector is supplied.
-    @test_throws ArgumentError BS.BornSampler(nontrivial_left_state())
+    unsupported_left_mpo() = FiniteMPS.MPO(nontrivial_left_state().A)
+    @test_throws ArgumentError BS.BornSampler(unsupported_left_mpo())
     @test_throws ArgumentError BS.BornSampler(
-        nontrivial_left_state(); left_boundary=ones(ComplexF64, 2),
+        unsupported_left_mpo(); left_boundary=ones(ComplexF64, 2),
     )
     @test_throws ArgumentError BS.BornSampler(
-        nontrivial_left_state(); left_boundary=ones(ComplexF64, 2, 2),
+        unsupported_left_mpo(); left_boundary=ones(ComplexF64, 2, 2),
     )
-    @test_throws DimensionMismatch BS.BornSampler(
-        nontrivial_left_state(); left_boundary=ones(ComplexF64, 3),
+    @test_throws ArgumentError BS.BornSampler(
+        unsupported_left_mpo(); left_boundary=ones(ComplexF64, 3),
     )
     @test_throws DimensionMismatch BS.bornsample!(
         MersenneTwister(15), sampler, Vector{Int}(undef, length(state) - 1),

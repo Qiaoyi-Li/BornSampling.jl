@@ -6,7 +6,7 @@ provide the symmetry-aware contractions used by every mode.
 
 ## Probability model
 
-### Pure MPS amplitudes
+### MPS amplitudes with an open boundary
 
 For an MPS, each local tensor has the canonical order
 
@@ -14,30 +14,40 @@ For an MPS, each local tensor has the canonical order
 A_i[\ell_i,x_i,r_i],
 ```
 
-and the contracted network defines an amplitude ``\psi(\boldsymbol{x})``.
-BornSampling draws the physical configuration from
+and the contracted network defines ``\psi(b,\boldsymbol{x})``, where ``b``
+labels the full left-boundary basis. The boundary contains one original sector
+with reduced multiplicity one; its full irrep dimension ``d_b`` may exceed
+one for a non-Abelian symmetry.
+
+With `purified=true`, BornSampling traces the boundary and draws
 
 ```math
 p(\boldsymbol{x})
-= \frac{|\psi(\boldsymbol{x})|^2}{\langle\psi|\psi\rangle}.
+= \frac{\sum_b|\psi(b,\boldsymbol{x})|^2}
+        {\sum_{b,\boldsymbol{x}'}|\psi(b,\boldsymbol{x}')|^2}.
 ```
+
+With `purified=false`, a synthetic first layer draws ``b`` before the physical
+sites from the joint Born distribution. The returned configuration is
+``[\boldsymbol{x};b]``, of length ``L+1``, including ``b=1`` when ``d_b=1``.
 
 ### Purification amplitudes
 
-An MPO is interpreted as a pure amplitude on a physical space and a
-purification space.  A rank-four local tensor has the order
+An MPO is interpreted as a pure amplitude on its open left boundary, physical
+spaces, and local purification spaces. A rank-four local tensor has the order
 
 ```math
 X_i[\ell_i,x_i,y_i,r_i],
 ```
 
-and a rank-three local tensor inside the same MPO supplies the synthetic value
-``y_i=1``.  The complete network defines ``X(\boldsymbol{x},\boldsymbol{y})``
-and hence the joint distribution
+and a rank-three site records ``y_i=0`` in joint output to mark its absent
+purification leg. Actual purification legs use one-based basis indices,
+including ``1`` for a one-dimensional leg. The complete network defines
+``X(b,\boldsymbol{x},\boldsymbol{y})`` and hence the joint distribution
 
 ```math
-p(\boldsymbol{x},\boldsymbol{y})
-= \frac{|X(\boldsymbol{x},\boldsymbol{y})|^2}
+p(\boldsymbol{x},\boldsymbol{y},b)
+= \frac{|X(b,\boldsymbol{x},\boldsymbol{y})|^2}
         {\langle X|X\rangle}.
 ```
 
@@ -47,58 +57,71 @@ The two MPO modes follow directly from this distribution:
 \begin{aligned}
 \text{traced mode:}\quad
 p(\boldsymbol{x})
-  &= \sum_{\boldsymbol{y}}p(\boldsymbol{x},\boldsymbol{y}),\\
+  &= \sum_{\boldsymbol{y},b}p(\boldsymbol{x},\boldsymbol{y},b),\\
 \text{joint mode:}\quad
-(\boldsymbol{x},\boldsymbol{y})
-  &\sim p(\boldsymbol{x},\boldsymbol{y}).
+(\boldsymbol{x},\boldsymbol{y},b)
+  &\sim p(\boldsymbol{x},\boldsymbol{y},b).
 \end{aligned}
 ```
 
-Thus discarding ``\boldsymbol{y}`` from joint samples also produces samples
+`purified=true` selects traced mode and `purified=false` selects joint mode.
+Joint sampling draws ``b`` first and returns
+``[\boldsymbol{x};\boldsymbol{y};b]``, of length ``2L+1``. Each site has a
+``y_i`` slot, and the boundary entry is always retained.
+
+Discarding ``\boldsymbol{y}`` and ``b`` from joint samples produces samples
 distributed according to the exact physical marginal ``p(\boldsymbol{x})``.
 
 ### Tangent-vector states
 
-A `FiniteMPSTangents.TangentMPS` represents the Hilbert-space state
+A `FiniteMPSTangents.TangentMPS` represents the Hilbert-space state with an
+open left-boundary index ``b``:
 
 ```math
-|\Phi_{\boldsymbol y,q}\rangle
-=\sum_{j=1}^L
-A^l_1\cdots A^l_{j-1}B_{j,q}A^r_{j+1}\cdots A^r_L.
+|\Phi_{b,\boldsymbol y,q}\rangle
+=\left[\sum_{j=1}^L
+A^l_1\cdots A^l_{j-1}B_{j,q}A^r_{j+1}\cdots A^r_L\right]_b.
 ```
 
-The insertion-site sum is coherent: all same-``q`` cross terms are retained.
-The extra ``q`` leg is one persistent global label, not a virtual bond and not
-a distinct local outcome at every site. Traced tangent sampling uses
+The insertion-site sum is coherent: all cross terms at fixed
+``(b,\boldsymbol y,q)`` are retained. The extra ``q`` leg is one persistent
+global label shared by all insertion positions. With `purified=true`, tangent
+sampling traces the left boundary, local purification legs, and global leg:
 
 ```math
-\rho=\sum_{\boldsymbol y,q}
-|\Phi_{\boldsymbol y,q}\rangle\langle\Phi_{\boldsymbol y,q}|,
+\rho=\sum_{b,\boldsymbol y,q}
+|\Phi_{b,\boldsymbol y,q}\rangle\langle\Phi_{b,\boldsymbol y,q}|.
 ```
 
-whereas joint tangent sampling draws ``(\boldsymbol x,\boldsymbol y,q)``. A
-synthetic first sampling layer draws ``q`` once when that global leg exists;
-site layers then propagate only the selected ``q``. The external configuration
-remains ordered as ``[\boldsymbol x;\boldsymbol y;q]``.
+With `purified=false`, synthetic layers draw ``b`` and then ``q`` when present,
+followed by site outcomes. Joint output is ``[\boldsymbol x;\boldsymbol y;b;q]``:
+``b`` is always included, and ``q`` is included when its leg exists. If any
+base tensor has rank four, the tangent is MPO-like and has one ``y_i`` slot
+per site, with ``0`` at rank-three sites and one-based indices at rank-four
+sites. With all rank-three base tensors, it is MPS-like and omits the
+``\boldsymbol y`` group. Traced output contains the ``L`` physical indices.
 
 ### Sequential probabilities
 
-At site ``i``, let ``a_i`` denote the sampled local outcome: ``x_i`` in MPS
-and traced-MPO modes, or ``(x_i,y_i)`` in joint-MPO mode.  The contraction
-produces nonnegative branch weights ``q_i(a_i)`` and
+At physical site ``i``, let ``a_i`` denote the sampled local outcome: ``x_i``
+in MPS and traced modes, or ``(x_i,y_i)`` at a rank-four joint-mode site. A
+rank-three joint-mode site samples ``x_i``. The contraction produces
+nonnegative branch weights ``q_i(a_i)`` and
 
 ```math
 z_i = \sum_{a_i}q_i(a_i), \qquad
 p(a_i\mid a_1,\ldots,a_{i-1}) = \frac{q_i(a_i)}{z_i}.
 ```
 
-The returned log probability is accumulated directly from conditional log
-weights,
+The physical-site contribution to the returned log probability is
 
 ```math
-\log p(a_1,\ldots,a_L)
-= \sum_{i=1}^{L}\left[\log q_i(a_i)-\log z_i\right].
+\sum_{i=1}^{L}\left[\log q_i(a_i)-\log z_i\right].
 ```
+
+Joint sampling also includes the conditional log probabilities of its initial
+boundary draw and, for a tangent with a global leg, the subsequent ``q`` draw.
+Thus `log_probability` describes the complete returned configuration.
 
 ### Unbiased estimates from samples
 
@@ -126,7 +149,7 @@ samples, because
 
 ```math
 \mathbb{P}(\boldsymbol{x}^{(s)}=\boldsymbol{x}_0)
-= \sum_{\boldsymbol{y}}p(\boldsymbol{x}_0,\boldsymbol{y})
+= \sum_{\boldsymbol{y},b}p(\boldsymbol{x}_0,\boldsymbol{y},b)
 = p(\boldsymbol{x}_0).
 ```
 
@@ -151,17 +174,17 @@ variance of this mean and ``s_O/\sqrt{N}`` supplies its standard error.
 
 ## Factorized boundary propagation
 
-After canonicalizing the state at site 1, the sampler needs only the collapsed
-left environment.  It stores that environment as a factor
+After canonicalizing an MPS or MPO at site 1, the sampler needs only the
+collapsed left environment. It stores that environment as a factor
 
 ```math
-\rho_i = C_i C_i^\dagger,
-\qquad
-\operatorname{tr}(C_i C_i^\dagger)=\lVert C_i\rVert_F^2=1.
+\rho_i = C_i C_i^\dagger.
 ```
 
-The initial pure boundary gives a factor with one auxiliary column.  For a
-fixed local physical and purification basis value, define
+Let ``C_i`` denote the factor entering physical site ``i``. Tracing the left
+boundary initializes ``C_1=I_{d_b}/\sqrt{d_b}``, with one column per full-basis
+boundary value. Each physical-site update normalizes its output to unit
+Frobenius norm. For a fixed local physical and purification basis value, define
 
 ```math
 K_i(x,y)[r,\ell]=X_i[\ell,x,y,r],
@@ -206,26 +229,32 @@ therefore reserves space for all physical-branch factors; this larger
 environment payload enables one-pass weight construction and immediate reuse
 by every child that is reached.
 
-### Pure and joint modes
+### MPS and joint modes
 
-An MPS has ``d_y=1`` and begins with one factor column, so the update remains a
-single ket column throughout the chain.  Joint MPO sampling also selects one
-specific pair ``(x,y)`` at each site; its update is
+A traced MPS propagates its ``d_b`` boundary columns through each selected
+physical channel. Its rank after site ``i`` is bounded by ``\min(d_b,D_i)``,
+where ``D_i`` is the full right bond dimension. Exact LQ compression reduces
+residual blocks with more columns than rows, preserving ``CC^\dagger``.
+
+Joint MPS and MPO sampling use the first-site contraction to draw the boundary
+value and conditionally normalize one ket column. They then select ``(x,y)``
+at rank-four sites and ``x`` at rank-three sites, with update
 
 ```math
 C_{i+1}=\frac{K_i(x,y)C_i}{\sqrt{q_i(x,y)}},
 ```
 
-and likewise remains a pure, rank-one factor.  These modes therefore inherit
-the usual dense-equivalent ``O(D^2)`` sequential contraction, while tracing a
-purification can raise the factor rank to ``D`` and gives ``O(D^3)`` worst-case
-work.  In every mode the environment remains represented lazily by
-``C_iC_i^\dagger``.
+The factor remains rank one. These modes therefore inherit the usual
+dense-equivalent ``O(D^2)`` sequential contraction. A traced MPS with ``r``
+active columns requires ``O(D^2r)`` work per local contraction, with
+``r\leq d_b``. Tracing local MPO purification can raise the factor rank to
+``D`` and gives ``O(D^3)`` worst-case work. In every mode the environment
+remains represented lazily by ``C_iC_i^\dagger``.
 
-For tangent joint sampling, fixing the synthetic global ``q`` root and one
-local ``y_i`` at every site likewise keeps the history factor rank one. The
-hot path applies each compiled residual-block route directly to the ``U`` and
-``V_q`` factor columns, without materializing a dense local channel. Thus the
+For tangent joint sampling, selecting the boundary, the global ``q`` when
+present, and one local ``y_i`` at each rank-four site keeps the history factor
+rank one. The hot path applies each compiled residual-block route directly to
+the ``U`` and ``V_q`` factor columns. Thus the
 fixed-``q`` MPS/MPO joint propagation has the same dense-equivalent
 ``O(D^2)`` character. Traced local purification may require a common exact
 history compression and has ``O(D^3)`` worst-case work.
@@ -236,18 +265,19 @@ The outer `BornSampling.FiniteMPS` concrete type chooses the global semantics:
 
 | input and constructor | sampled outcome | factor update |
 |:--|:--|:--|
-| `BornSampling.FiniteMPS.MPS` | ``x_i`` | pure rank-one propagation |
-| `BornSampling.FiniteMPS.MPO`, `purified=true` | ``x_i`` | purification trace and exact factor compression |
-| `BornSampling.FiniteMPS.MPO`, `purified=false` | ``(x_i,y_i)`` | joint rank-one propagation |
-| `FiniteMPSTangents.TangentMPS`, `purified=true` | ``x_i`` | common ``(U,V_q)`` history propagation |
-| `FiniteMPSTangents.TangentMPS`, `purified=false` | one global ``q``, then ``(x_i,y_i)`` | fixed-q rank-one history propagation |
+| `BornSampling.FiniteMPS.MPS`, `purified=true` | ``x_i`` | boundary trace and exact factor compression |
+| `BornSampling.FiniteMPS.MPS`, `purified=false` | one boundary ``b``, then ``x_i`` | rank-one propagation |
+| `BornSampling.FiniteMPS.MPO`, `purified=true` | ``x_i`` | boundary and local purification trace, with exact compression |
+| `BornSampling.FiniteMPS.MPO`, `purified=false` | one boundary ``b``, then local outcomes | rank-one propagation |
+| `FiniteMPSTangents.TangentMPS`, `purified=true` | ``x_i`` | boundary trace in common ``(U,V_q)`` history |
+| `FiniteMPSTangents.TangentMPS`, `purified=false` | one boundary ``b``, optional global ``q``, then local outcomes | rank-one history propagation |
 
 Construction checks once that every tensor in an MPS is rank three.  An MPO
-may mix rank-three and rank-four sites.  At a rank-three MPO site, the local
-purification basis is the singleton ``y_i=1``; a traced MPO still carries any
-factor rank accumulated at earlier rank-four sites.  This division keeps the
-probability model global while local static rank controls only leg access and
-the contraction kernel.
+may mix rank-three and rank-four sites. At a rank-three MPO site, contraction
+uses a singleton purification basis and joint output records ``y_i=0``. A
+traced MPO carries the factor rank from its boundary and earlier rank-four
+sites. This division keeps the probability model global while local static
+rank controls only leg access and the contraction kernel.
 
 ## Compiled symmetry contractions
 
@@ -291,13 +321,14 @@ loop and probability calculation remain shared.
 
 ## Layer-synchronous prefix reuse
 
-A batched call advances every shot one site per layer. The current frontier
-stores the sampled prefixes entering that site; a separate next frontier
-receives the children selected there. Each node carries its prefix log
+A batched call advances every shot through the synthetic and physical layers.
+The current frontier stores the sampled prefixes entering that layer; a
+separate next frontier receives the children selected there. Each node carries its prefix log
 probability, next-site branch weights, child slots, and TensorMap space metadata
-for its numerical environment. MPS and joint-MPO nodes own one normalized
-rank-one factor. Traced-MPO nodes own the complete uncompressed ``G_x`` bank
-produced by their weight pass. Shots that reach the same prefix reuse its branch
+for its numerical environment. MPS nodes own one factor, with several columns
+when their boundary is traced. Joint-MPO nodes own one rank-one factor.
+Traced-MPO nodes own the complete uncompressed ``G_x`` bank produced by their
+weight pass. Shots that reach the same prefix reuse its branch
 weights and environment payload.
 
 Within a layer, a shared atomic counter dynamically assigns shots to workers.
@@ -345,6 +376,10 @@ consumed exactly once by the outer layer scheduler and shared read-only by all
 workers. The same-site ``B^\dagger I B`` term enters once; the two ``K_q``
 orientations account for distinct-site cross terms without double counting.
 
+The synthetic boundary and global-``q`` roots share the full-chain completion.
+It weights the boundary draw and the conditional ``q`` draw, then physical
+layers consume completions indexed by local site.
+
 With `disk=false`, pending completions live in batch memory. With `disk=true`,
 the first active completion stays in memory and the right sweep serializes the
 rest. The scheduler loads one completion before its layer barrier, and that
@@ -358,7 +393,7 @@ from the probability-ranked prefix cache and has no `maxsize` policy.
 Prefix metadata and branch weights stay in memory for their frontier. Larger
 numerical environments are managed separately. With disk storage enabled,
 every frontier maintains its own probability-ranked set of at most `maxsize`
-resident environments: one normalized factor for an MPS or joint-MPO node, or
+resident environments: one factor for an MPS or joint-MPO node, or
 one complete branch bank for a traced-MPO node. Other environments in that
 frontier are stored as raw TensorMap records.
 
@@ -375,5 +410,5 @@ environments are read or consumed and the destination frontier is constructed.
 An admission lock serializes destination dictionary updates and top-set
 replacement. Each raw TensorMap record is published through a temporary file
 followed by an atomic rename, and immutable space metadata reconstructs a
-rank-one factor or a traced branch-bank member. Removing the source frontier at
+factor or a traced branch-bank member. Removing the source frontier at
 the layer boundary also removes its temporary directory.

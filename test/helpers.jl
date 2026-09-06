@@ -424,6 +424,77 @@ function dense_joint_weights(state; left_boundary=nothing)
     return weights
 end
 
+"Dense MPS probabilities with the full left boundary traced or retained as `[x..., b]`."
+function dense_mps_boundary_weights(state; purified=true)
+    tensors = map(site -> convert(Array, site.A), state.A)
+    physical_dimensions = map(A -> size(A, 2), tensors)
+    left_dimension = size(first(tensors), 1)
+    weights = Dict{Tuple{Vararg{Int}},Float64}()
+    for physical in all_configurations(physical_dimensions)
+        # Each column starts from a different orthonormal full left-basis vector.
+        # Keeping these amplitudes separate makes the boundary trace incoherent.
+        amplitudes = Matrix{eltype(first(tensors))}(I, left_dimension, left_dimension)
+        for (site, A) in enumerate(tensors)
+            amplitudes = transpose(@view(A[:, physical[site], :])) * amplitudes
+        end
+        if purified
+            weights[Tuple(physical)] = real(sum(abs2, amplitudes))
+        else
+            for boundary in 1:left_dimension
+                weights[Tuple(vcat(physical, boundary))] =
+                    real(sum(abs2, @view amplitudes[:, boundary]))
+            end
+        end
+    end
+    return weights
+end
+
+"Dense MPO probabilities with every purification leg traced or kept as `[x..., y..., q]`."
+function dense_mpo_boundary_weights(state; purified=true)
+    tensors = map(site -> convert(Array, site.A), state.A)
+    physical_dimensions = map(A -> size(A, 2), tensors)
+    purification_dimensions = map(A -> ndims(A) == 4 ? size(A, 3) : 1, tensors)
+    absent_purification_sites = findall(A -> ndims(A) == 3, tensors)
+    left_dimension = size(first(tensors), 1)
+    weights = Dict{Tuple{Vararg{Int}},Float64}()
+    for physical in all_configurations(physical_dimensions)
+        physical_weight = 0.0
+        for purification in all_configurations(purification_dimensions)
+            amplitudes = Matrix{eltype(first(tensors))}(I, left_dimension, left_dimension)
+            for (site, A) in enumerate(tensors)
+                K = if ndims(A) == 4
+                    transpose(@view A[:, physical[site], purification[site], :])
+                else
+                    transpose(@view A[:, physical[site], :])
+                end
+                amplitudes = K * amplitudes
+            end
+            if purified
+                physical_weight += real(sum(abs2, amplitudes))
+            else
+                external_purification = copy(purification)
+                external_purification[absent_purification_sites] .= 0
+                for boundary in 1:left_dimension
+                    configuration = vcat(physical, external_purification, boundary)
+                    weights[Tuple(configuration)] =
+                        real(sum(abs2, @view amplitudes[:, boundary]))
+                end
+            end
+        end
+        purified && (weights[Tuple(physical)] = physical_weight)
+    end
+    return weights
+end
+
+"Describe only actual local purification legs, independently of compiled sampler plans."
+function mpo_joint_layout(state)
+    tensors = map(site -> convert(Array, site.A), state.A)
+    physical_dimensions = map(A -> size(A, 2), tensors)
+    purification_dimensions = map(A -> ndims(A) == 4 ? size(A, 3) : 1, tensors)
+    purification_sites = findall(A -> ndims(A) == 4, tensors)
+    return (; physical_dimensions, purification_dimensions, purification_sites)
+end
+
 function normalize_weights!(weights)
     normalization = sum(values(weights))
     normalization > 0 || error("oracle state has zero norm")
@@ -572,6 +643,32 @@ function uniforms_for_joint_configuration(
         push!(uniforms, (lower_mass + selected_mass / 2) / prefix_mass)
     end
     return uniforms
+end
+
+"Force `[x..., y..., q]` with absent y=0 while drawing q, then one local `(x,y)` per site."
+function uniforms_for_mpo_boundary_configuration(probabilities, target, state)
+    layout = mpo_joint_layout(state)
+    chain_length = length(layout.physical_dimensions)
+    expected_length = 2 * chain_length + 1
+    length(target) == expected_length || throw(DimensionMismatch(
+        "joint MPO target length must be twice the chain length plus one boundary index",
+    ))
+    function draw_order(configuration)
+        purification = ones(Int, chain_length)
+        for site in layout.purification_sites
+            purification[site] = configuration[chain_length + site]
+        end
+        outcomes = [
+            (configuration[site] - 1) * layout.purification_dimensions[site] +
+            purification[site] for site in 1:chain_length
+        ]
+        return vcat(last(configuration), outcomes)
+    end
+    ordered_reference = Dict(
+        Tuple(draw_order(configuration)) => probability
+        for (configuration, probability) in probabilities
+    )
+    return uniforms_for_configuration(ordered_reference, draw_order(target))
 end
 
 

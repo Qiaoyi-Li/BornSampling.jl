@@ -12,42 +12,46 @@ BornSampling exports [`BornSampler`](@ref) and [`bornsample!`](@ref).
 BornSampler
 ```
 
-For an `MPS`, construction selects pure-state sampling and the configuration
-length is `L = length(state)`.
+For an `MPS`, `purified=true` traces the full left boundary and returns
+`L = length(state)` physical indices. With `purified=false`, the joint
+configuration is `[x₁, …, xL, b]`, with `L + 1` entries.
 
-For an `MPO`, `purified=true` selects the exact physical marginal and also
-returns `L` indices. `purified=false` selects the joint distribution and
-returns `2L` indices ordered as
+For an `MPO`, `purified=true` traces the full left boundary and every local
+purification leg, returning `L` physical indices. `purified=false` samples
+their joint distribution and returns `2L + 1` indices ordered as
 
 ```text
-x₁, x₂, …, xL, y₁, y₂, …, yL.
+x₁, x₂, …, xL, y₁, y₂, …, yL, b.
 ```
 
-A rank-3 site inside an MPO contributes the synthetic purification index
-`yᵢ = 1`. This gives mixed rank-3/rank-4 MPOs one consistent configuration
-layout.
+A rank-three site inside an MPO records `yᵢ = 0` for its absent purification
+leg. An actual purification leg uses one-based indices, including `1` for a
+one-dimensional leg. Every joint MPS/MPO configuration includes the boundary
+entry `b`, including `b = 1` for a one-dimensional boundary.
 
 For a `FiniteMPSTangents.TangentMPS`, the sampler represents the coherent sum
 of all one-site insertion terms under the tangent-space/Hilbert-space
-isomorphism. With `purified=true`, local MPO purification legs and the
-persistent global tangent-symmetry leg are traced, and the configuration
-contains `L` physical indices. With `purified=false`, all existing local
-purification legs and the one global leg are sampled. The layout is
+isomorphism. With `purified=true`, the full left boundary, local purification
+legs, and persistent global tangent-symmetry leg are traced, and the
+configuration contains `L` physical indices. With `purified=false`, all these
+indices are sampled jointly. The layout is
 
 ```text
-x₁, …, xL [, y₁, …, yL] [, q].
+x₁, …, xL [, y₁, …, yL], b [, q].
 ```
 
 The `y` group is present when any base tensor is rank four; rank-three sites in
-such a mixed base contribute `yᵢ = 1`. The final `q` entry is present only when
-the tangent tensors carry the extra persistent leg. The tangent and its base
-point are not mutated or canonicalized. The compiled sampler retains views
+such a mixed base record `yᵢ = 0`. The boundary `b` is always present. The final
+`q` entry is present when the tangent tensors carry the extra persistent leg.
+Each actual one-dimensional leg records `1`. The tangent and its base point
+are not mutated or canonicalized. The compiled sampler retains views
 into their tensor blocks, so they must not be modified while it is in use.
 
-`left_boundary` accepts a pure boundary vector for a supported nontrivial left
-boundary. Sampler construction normalizes that vector, compiles the local
-contractions, and allocates reusable worker workspaces. Direct MPS/MPO inputs
-are additionally canonicalized at site 1.
+All three input types use the entire left boundary, containing one original
+sector with reduced multiplicity one. Its full non-Abelian dimension may
+exceed one. Sampler construction compiles the local contractions and allocates
+reusable worker workspaces. Direct MPS/MPO inputs are additionally
+canonicalized at site 1.
 
 ## Drawing samples
 
@@ -55,12 +59,15 @@ are additionally canonicalized at site 1.
 bornsample!
 ```
 
-The allocation-conscious single-shot form writes into a caller-owned vector:
+The allocation-conscious single-shot form writes into a caller-owned vector.
+For `purified=true`:
 
 ```julia
 config = Vector{Int}(undef, length(state))
 logp = BornSampling.bornsample!(rng, sampler, config)
 ```
+
+For joint sampling, size the buffer according to the layout above.
 
 The allocating convenience form returns a named tuple:
 
@@ -116,7 +123,10 @@ prefix-ready metadata, and numerical workspaces across calls.
 Every physical index is a one-based flat index in the corresponding
 `BornSampling.TK` physical-space canonical basis. Within a sector, the irrep
 index changes fastest and the degeneracy index changes next. Joint MPO
-configurations use the same convention for each purification index.
+configurations use the same convention for each actual purification index.
+The boundary `b` and global tangent `q` follow the full canonical-basis order
+of their respective spaces. A purification value of `0` marks a rank-three
+site's absent leg.
 
 The exclamation mark records the public mutations: the core form writes
 `config`, every sampler call reuses mutable numerical workspaces, and direct

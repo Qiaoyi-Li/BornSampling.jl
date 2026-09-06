@@ -4,25 +4,25 @@
         chain_length = length(sampler.state)
         @test chain_length == 2
 
-        reference = normalize_weights!(dense_joint_weights(sampler.state))
+        reference = normalize_weights!(dense_mpo_boundary_weights(sampler.state; purified=false))
         @test length(reference) == prod(
             plan.physical.fulldim * BS.purification_dimension(plan) for
-            plan in sampler.plans
+            plan in sampler.plans[2:end]
         )
         @test sum(values(reference)) ≈ 1 atol=8e-13
 
-        physical_dimensions = map(plan -> plan.physical.fulldim, sampler.plans)
-        purification_dimensions = map(BS.purification_dimension, sampler.plans)
+        physical_dimensions = map(plan -> plan.physical.fulldim, sampler.plans[2:end])
+        purification_dimensions = map(BS.purification_dimension, sampler.plans[2:end])
         for physical in all_configurations(physical_dimensions)
             for purification in all_configurations(purification_dimensions)
-                target = vcat(physical, purification)
+                target = vcat(physical, purification, 1)
                 iszero(reference[Tuple(target)]) && continue
-                uniforms = uniforms_for_joint_configuration(
+                uniforms = uniforms_for_mpo_boundary_configuration(
                     reference,
                     target,
-                    purification_dimensions,
+                    sampler.state,
                 )
-                configuration = Vector{Int}(undef, 2 * chain_length)
+                configuration = Vector{Int}(undef, 2 * chain_length + 1)
                 log_probability = BS.bornsample!(
                     SequenceRNG(uniforms),
                     sampler,
@@ -36,7 +36,8 @@
 
         shot = BS.bornsample!(MersenneTwister(0x6a6f_696e), sampler)
         @test keys(shot) == (:configuration, :log_probability)
-        @test length(shot.configuration) == 2 * chain_length
+        @test length(shot.configuration) == 2 * chain_length + 1
+        @test last(shot.configuration) == 1
         @test all(
             site -> 1 <= shot.configuration[site] <= physical_dimensions[site],
             1:chain_length,
@@ -57,7 +58,7 @@
         @test_throws DimensionMismatch BS.bornsample!(
             MersenneTwister(0x6c6f_6e67),
             sampler,
-            Vector{Int}(undef, 2 * chain_length + 1),
+            Vector{Int}(undef, 2 * chain_length),
         )
 
         # The default purified mode remains a physical-only marginal.
@@ -84,13 +85,17 @@
     @testset "rank-4 batch scheduling and factor storage" begin
         sampler = BS.BornSampler(residual_route_rank4_state(); purified=false)
         chain_length = length(sampler.state)
-        reference = normalize_weights!(dense_joint_weights(sampler.state))
+        reference = normalize_weights!(dense_mpo_boundary_weights(sampler.state; purified=false))
         nshots = 40
         seed = 0x7061_6972
 
         workspace = first(sampler.workspaces)
-        plan = first(sampler.plans)
+        root = first(sampler.plans)
+        plan = sampler.plans[2]
         C = sampler.initial_factor
+        BS._compute_weights!(workspace, C, root)
+        boundary = argmax(@view workspace.q[1:BS._outcome_count(workspace, root)])
+        C = BS._advance_factor!(workspace, C, root, boundary, workspace.q[boundary])
         BS._compute_weights!(workspace, C, plan)
         branch_count = plan.physical.fulldim * BS.purification_dimension(plan)
         selected = argmax(@view workspace.q[1:branch_count])
@@ -155,7 +160,7 @@
             maxsize=1,
         )
 
-        @test size(serial.configuration) == (2 * chain_length, nshots)
+        @test size(serial.configuration) == (2 * chain_length + 1, nshots)
         @test length(serial.log_probability) == nshots
         @test parallel.configuration == serial.configuration
         @test parallel.log_probability == serial.log_probability
@@ -178,14 +183,14 @@
         @test map(BS.purification_dimension, traced.plans) == [2, 1]
 
         traced_reference = normalize_weights!(dense_physical_weights(traced.state))
-        joint_reference = normalize_weights!(dense_joint_weights(joint.state))
+        joint_reference = normalize_weights!(dense_mpo_boundary_weights(joint.state; purified=false))
         physical_dimensions = map(plan -> plan.physical.fulldim, traced.plans)
-        purification_dimensions = map(BS.purification_dimension, joint.plans)
 
         @test sum(values(traced_reference)) ≈ 1 atol=3e-13
         @test sum(values(joint_reference)) ≈ 1 atol=3e-13
-        @test all(configuration -> configuration[chain_length + 2] == 1,
+        @test all(configuration -> configuration[chain_length + 2] == 0,
                   keys(joint_reference))
+        @test all(configuration -> last(configuration) == 1, keys(joint_reference))
 
         for physical in all_configurations(physical_dimensions)
             key = Tuple(physical)
@@ -207,18 +212,19 @@
         for (target_tuple, probability) in joint_reference
             iszero(probability) && continue
             target = collect(target_tuple)
-            configuration = Vector{Int}(undef, 2 * chain_length)
+            configuration = Vector{Int}(undef, 2 * chain_length + 1)
             log_probability = BS.bornsample!(
-                SequenceRNG(uniforms_for_joint_configuration(
+                SequenceRNG(uniforms_for_mpo_boundary_configuration(
                     joint_reference,
                     target,
-                    purification_dimensions,
+                    joint.state,
                 )),
                 joint,
                 configuration,
             )
             @test configuration == target
-            @test configuration[chain_length + 2] == 1
+            @test configuration[chain_length + 2] == 0
+            @test last(configuration) == 1
             @test exp(log_probability) ≈ probability rtol=2e-12 atol=3e-13
         end
 
@@ -263,7 +269,7 @@
         @test size(joint_workspace.route_output, 2) == 1
         for plan in joint.plans
             BS._compute_weights!(joint_workspace, factor, plan)
-            count = plan.physical.fulldim * BS.purification_dimension(plan)
+            count = BS._outcome_count(joint_workspace, plan)
             selected = argmax(@view joint_workspace.q[1:count])
             factor = BS._advance_factor!(
                 joint_workspace,
@@ -281,7 +287,7 @@
         seed = 0x6d69_7862
         for (sampler, expected_rows) in (
             (traced, chain_length),
-            (joint, 2 * chain_length),
+            (joint, 2 * chain_length + 1),
         )
             serial = BS.bornsample!(
                 MersenneTwister(seed),
@@ -319,59 +325,8 @@
             ntasks=1,
             disk=false,
         )
-        @test all(==(1), @view joint_batch.configuration[chain_length + 2, :])
+        @test all(iszero, @view joint_batch.configuration[chain_length + 2, :])
+        @test all(==(1), @view joint_batch.configuration[end, :])
     end
 
-    @testset "MPS ignores the MPO purification switch" begin
-        source = rank3_state(length=4, bonddim=3)
-        default_sampler = BS.BornSampler(deepcopy(source))
-        joint_flag_sampler = BS.BornSampler(deepcopy(source); purified=false)
-        chain_length = length(source)
-        seed = 0x7261_6e6b
-
-        default_configuration = Vector{Int}(undef, chain_length)
-        flagged_configuration = Vector{Int}(undef, chain_length)
-        default_log_probability = BS.bornsample!(
-            MersenneTwister(seed),
-            default_sampler,
-            default_configuration,
-        )
-        flagged_log_probability = BS.bornsample!(
-            MersenneTwister(seed),
-            joint_flag_sampler,
-            flagged_configuration,
-        )
-        @test flagged_configuration == default_configuration
-        @test flagged_log_probability == default_log_probability
-        @test length(flagged_configuration) == chain_length
-
-        default_batch = BS.bornsample!(
-            MersenneTwister(seed),
-            default_sampler,
-            24;
-            ntasks=Threads.nthreads() + 2,
-            disk=true,
-            maxsize=1,
-        )
-        flagged_batch = BS.bornsample!(
-            MersenneTwister(seed),
-            joint_flag_sampler,
-            24;
-            ntasks=Threads.nthreads() + 2,
-            disk=true,
-            maxsize=1,
-        )
-        @test flagged_batch.configuration == default_batch.configuration
-        @test flagged_batch.log_probability == default_batch.log_probability
-        @test size(flagged_batch.configuration, 1) == chain_length
-
-        workspace = first(joint_flag_sampler.workspaces)
-        plan = first(joint_flag_sampler.plans)
-        C = joint_flag_sampler.initial_factor
-        BS._compute_weights!(workspace, C, plan)
-        selected = argmax(@view workspace.q[1:plan.physical.fulldim])
-        G = BS._build_selected_factor!(workspace, C, plan, selected)
-        @test Int(TK.dim(TK.domain(G))) == 1
-        @test size(workspace.route_output, 2) == 1
-    end
 end

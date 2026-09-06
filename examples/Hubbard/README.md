@@ -68,12 +68,14 @@ and its elementwise standard-error estimate.
 
 The thermal script constructs `BornSampling.BornSampler(factor)` with the
 default `purified=true`. This draws physical configurations from the exact
-marginal obtained by tracing the MPO purification index.
+marginal obtained by tracing the MPO left boundary and local purification
+indices.
 
 For joint physical--purification snapshots, construct
 `BornSampling.BornSampler(factor; purified=false)`. The resulting configuration
-matrix places the physical rows first and the purification rows second:
+matrix places the physical rows first, the purification rows second, and the
+left-boundary value last:
 
 ```text
-x₁, …, xL, y₁, …, yL
+x₁, …, xL, y₁, …, yL, b
 ```

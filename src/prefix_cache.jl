@@ -1,9 +1,9 @@
 # One-frontier prefix metadata and numerical-environment storage.
 #
-# A batch advances every shot one site at a time. During a layer transition the
+# A batch advances every shot one sampling layer at a time. During a transition the
 # current cache supplies parent environments and a separate next cache receives
 # child nodes. After the layer barrier the current cache is discarded. MPS and
-# joint-MPO nodes own one normalized collapsed factor, while traced-MPO nodes
+# joint-MPO nodes own one propagated factor, while traced-MPO nodes
 # own the complete bank of uncompressed next-physical-branch factors.
 
 """A concurrently published child edge in the sampled-prefix tree."""
@@ -24,10 +24,10 @@ end
 """
 Metadata for one sampled prefix.
 
-`q` contains the next-site branch weights and is always resident; its sum is
+`q` contains the next-layer branch weights and is always resident; its sum is
 computed at the point of use instead of being stored as duplicate metadata.
 The numerical environment itself is deliberately absent. For an extendable
-MPS or joint-MPO prefix, `factor_space` reconstructs its normalized collapsed
+MPS or joint-MPO prefix, `factor_space` reconstructs its propagated
 factor. For an extendable traced-MPO prefix, `branch_factor_spaces` reconstruct
 the complete uncompressed `G_x` bank, whose entries are moved out once their
 edges are created. Other sampling modes may use a self-describing environment
@@ -337,7 +337,7 @@ end
 """
 Store the numerical environment for a newly registered child node. Ownership
 is transferred to the cache, so the caller must not mutate `owned` afterwards.
-For MPS and joint MPO nodes this is one normalized factor; for traced MPO nodes
+For MPS and joint MPO nodes this is one propagated factor; for traced MPO nodes
 it is the complete uncompressed physical-branch bank.
 
 The caller publishes the child id only after this function returns. Because a

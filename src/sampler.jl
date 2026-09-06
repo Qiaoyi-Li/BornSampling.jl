@@ -2,8 +2,18 @@ abstract type AbstractSamplingMode end
 abstract type PhysicalSamplingMode <: AbstractSamplingMode end
 
 struct MPSMode <: PhysicalSamplingMode end
+struct JointMPSMode <: PhysicalSamplingMode end
 struct TracedMPOMode <: PhysicalSamplingMode end
 struct JointMPOMode <: AbstractSamplingMode end
+
+"""First joint-sampling layer: draw the full left-basis index b and store it last."""
+struct BoundaryPlan{L,RL,R} <: AbstractSitePlan
+    boundary::L
+    residual_right::RL
+    boundary_basis::Vector{BasisInfo}
+    weights::Vector{R}
+    output_row::Int
+end
 
 """Reusable numerical scratch owned by one sampling worker task."""
 mutable struct SamplingWorkspace{M<:AbstractSamplingMode,T,Rprob,Scratch}
@@ -14,15 +24,19 @@ mutable struct SamplingWorkspace{M<:AbstractSamplingMode,T,Rprob,Scratch}
 end
 
 """
-    BornSampler(state::Union{FiniteMPS.MPS,FiniteMPS.MPO};
-                left_boundary=nothing, purified=true)
+    BornSampler(state::Union{FiniteMPS.MPS,FiniteMPS.MPO}; purified=true)
 
-Compile an in-memory `FiniteMPS.MPS` or `FiniteMPS.MPO` for repeated sequential
-Born sampling. An `MPS` is sampled as a rank-three physical amplitude. For an
-`MPO`, the default `purified=true` traces every rank-four tensor's first domain
-leg and samples the exact physical marginal. With `purified=false`, that leg is
-sampled jointly with the physical leg. Rank-three sites inside an `MPO` use a
-one-dimensional synthetic purification leg in either mode.
+Compile an in-memory state of length `L` for repeated Born sampling. With
+`purified=true`, trace the full left boundary and every local purification
+leg, returning the physical marginal in `[x₁, …, xL]` order.
+
+With `purified=false`, sample all these indices. An `MPS` returns
+`[x₁, …, xL, b]`; an `MPO` returns `[x₁, …, xL, y₁, …, yL, b]`. The boundary
+index `b` is sampled before the sites and is always returned, including `b=1`
+for a one-dimensional boundary. Each rank-four MPO tensor's first domain leg
+supplies its local `yᵢ`. A rank-three site has no such leg and returns `yᵢ=0`;
+an actual one-dimensional purification leg returns `yᵢ=1`. All sampled indices
+use the one-based flat order of their TensorKit canonical bases.
 
 Construction calls `FiniteMPS.canonicalize!(state, 1)` in place, compiles all
 fusion-tree contraction plans, and allocates one reusable workspace. The
@@ -30,9 +44,7 @@ sampler keeps views into `state`, so the state and its tensor data must not be
 modified after construction.
 
 The left virtual space must contain one original sector with reduced
-multiplicity one. If its full dimension exceeds one, `left_boundary` must
-provide the pure state inside that sector. Mixed boundaries and coherent
-superpositions across residual charges are not supported.
+multiplicity one; its full irrep dimension may exceed one.
 
 One public batch call may use multiple internal worker tasks, each with an
 independent workspace. Concurrent external calls using the same sampler are
@@ -50,9 +62,8 @@ function BornSampler(
     left_boundary=nothing,
     purified::Bool=true,
 )
-    # `purified` is accepted for a uniform public call signature and has no
-    # effect on an MPS, whose local tensors have no purification leg.
-    return _construct_sampler(state, MPSMode, left_boundary)
+    mode = purified ? MPSMode : JointMPSMode
+    return _construct_sampler(state, mode, left_boundary)
 end
 
 function BornSampler(
@@ -70,6 +81,10 @@ function _construct_sampler(
     ::Type{M},
     left_boundary,
 ) where {M<:AbstractSamplingMode}
+    left_boundary === nothing || throw(ArgumentError(
+        "MPS/MPO left_boundary vectors are no longer supported; use purified=true " *
+        "to trace the boundary leg or purified=false to sample it",
+    ))
     length(state) > 0 || throw(ArgumentError("cannot sample an empty DenseMPS"))
     state.A isa Vector || throw(ArgumentError(
         "BornSampler supports only in-memory DenseMPS storage",
@@ -81,10 +96,12 @@ function _construct_sampler(
 
     first_tensor = state[1]
     S = _style_type(first_tensor)
-    return _build_sampler(M, S, state, left_boundary)
+    return _build_sampler(M, S, state)
 end
 
-function _validate_local_tensors(state::FiniteMPS.MPS, ::Type{MPSMode})
+function _validate_local_tensors(state::FiniteMPS.MPS, ::Type{M}) where {
+    M<:Union{MPSMode,JointMPSMode},
+}
     for tensor in state.A
         tensor isa FiniteMPS.MPSTensor{3} || throw(ArgumentError(
             "FiniteMPS.MPS sampling requires MPSTensor{3} at every site",
@@ -109,7 +126,6 @@ function _build_sampler(
     ::Type{M},
     ::Type{S},
     state::FiniteMPS.DenseMPS,
-    left_boundary,
 ) where {M<:AbstractSamplingMode,S}
     L = length(state)
     sector_type = TK.sectortype(state[1].A)
@@ -143,6 +159,9 @@ function _build_sampler(
     Rprob = typeof(real(zero(T)))
 
     qmax = maximum(plan -> _outcome_count(M, plan), plans)
+    if M <: Union{JointMPSMode,JointMPOMode}
+        qmax = max(qmax, first_plan.left.fulldim)
+    end
     scratch_max = maximum(scratch_length, plans)
     residual_block_max = maximum(plans) do plan
         max(
@@ -154,13 +173,7 @@ function _build_sampler(
         max(length(plan.residual_left.sectors), length(plan.residual_right.sectors))
     end
 
-    boundary = _prepare_left_boundary(left_boundary, T, first_plan.left.fulldim)
-    initial_factor = _build_initial_factor(
-        T,
-        boundary,
-        first_plan.left,
-        first_plan.residual_left,
-    )
+    initial_factor = _build_boundary_factor(T, first_plan.left, first_plan.residual_left)
     workspace = _allocate_workspace(
         M,
         S,
@@ -169,8 +182,14 @@ function _build_sampler(
         residual_block_max,
         residual_sector_max,
         qmax,
-        scratch_max,
+        scratch_max;
+        factor_columns=M === MPSMode ? first_plan.left.fulldim :
+                       _route_columns(M, residual_block_max),
     )
+    boundary_row = M === JointMPOMode ? 2 * L + 1 : L + 1
+    if M <: Union{JointMPSMode,JointMPOMode}
+        pushfirst!(plans, _compile_boundary(first_plan, initial_factor, workspace, boundary_row))
+    end
 
     return BornSampler{
         M,typeof(state),typeof(plans),typeof(initial_factor),typeof(workspace),
@@ -182,55 +201,61 @@ function _build_sampler(
     )
 end
 
-function _prepare_left_boundary(left_boundary, ::Type{T}, dimension::Int) where {T}
-    if left_boundary === nothing
-        dimension == 1 || throw(ArgumentError(
-            "left_boundary is required when the full left virtual dimension is $dimension",
-        ))
-        return T[one(T)]
-    end
-    left_boundary isa AbstractVector || throw(ArgumentError(
-        "left_boundary must be a pure-state vector; mixed boundaries are not supported",
-    ))
-    length(left_boundary) == dimension || throw(DimensionMismatch(
-        "left_boundary has length $(length(left_boundary)); expected $dimension",
-    ))
-    boundary = try
-        Vector{T}(left_boundary)
-    catch error
-        error isa Union{InexactError,MethodError,ArgumentError} || rethrow()
-        throw(ArgumentError("left_boundary entries must be convertible to workspace type $T"))
-    end
-    boundary_norm = norm(boundary)
-    isfinite(boundary_norm) && !iszero(boundary_norm) || throw(ArgumentError(
-        "left_boundary must have a finite, nonzero norm",
-    ))
-    boundary ./= boundary_norm
-    return boundary
-end
-
-function _build_initial_factor(
-    ::Type{T},
-    boundary::Vector{T},
-    full_left::SpaceInfo,
-    residual_left::ResidualSpaceInfo,
-) where {T}
+function _validate_left_multiplet(full_left::SpaceInfo)
     length(full_left.sectors) == 1 && only(full_left.multiplicities) == 1 ||
         throw(ArgumentError(
             "the left virtual space must have one original sector with reduced " *
             "multiplicity one",
         ))
+    return nothing
+end
 
+function _build_boundary_factor(
+    ::Type{T},
+    full_left::SpaceInfo,
+    residual_left::ResidualSpaceInfo,
+) where {T}
+    _validate_left_multiplet(full_left)
     embedding = only(residual_left.embeddings)
     charge = residual_left.sectors[embedding.residual_slot]
-    factor_space = _residual_space(typeof(charge), (charge => 1,))
+    dimension = full_left.fulldim
+    factor_space = _residual_space(typeof(charge), (charge => dimension,))
     C = TK.TensorMap{T}(undef, residual_left.space, factor_space)
     fill!(C, zero(T))
     block = TK.block(C, charge)
-    @inbounds for row in eachindex(boundary)
-        block[embedding.rows[row], 1] = boundary[row]
+    scale = inv(sqrt(convert(T, dimension)))
+    @inbounds for column in 1:dimension
+        block[embedding.rows[column], column] = scale
     end
     return C
+end
+
+function _boundary_column(C, residual_left::ResidualSpaceInfo, selected::Int)
+    charge = only(residual_left.sectors)
+    factor_space = _residual_space(typeof(charge), (charge => 1,))
+    column = TK.TensorMap{eltype(C)}(undef, residual_left.space, factor_space)
+    copyto!(TK.block(column, charge), view(TK.block(C, charge), :, selected:selected))
+    return column
+end
+
+function _compile_boundary(first_plan, initial_factor, workspace, output_row::Int)
+    dimension = first_plan.left.fulldim
+    weights = Vector{eltype(workspace.q)}(undef, dimension)
+    # Sites after the first are right-isometric. Contract the first tensor to
+    # obtain the complete boundary marginal without assuming uniform weights.
+    for selected in 1:dimension
+        column = _boundary_column(initial_factor, first_plan.residual_left, selected)
+        _compute_weights!(workspace, column, first_plan)
+        weights[selected] = sum(view(workspace.q, 1:_outcome_count(workspace, first_plan)))
+    end
+    _total_weight(weights, dimension, 1)
+    return BoundaryPlan(
+        first_plan.left,
+        first_plan.residual_left,
+        _basis_info(first_plan.left),
+        weights,
+        output_row,
+    )
 end
 
 _allocate_scratch(::Type{UniqueStyle}, ::Type{T}, ::Int) where {T} = nothing
@@ -238,6 +263,7 @@ _allocate_scratch(::Type{FusionTreeStyle}, ::Type{T}, length::Int) where {T} =
     zeros(T, length)
 
 _route_columns(::Type{MPSMode}, ::Int) = 1
+_route_columns(::Type{JointMPSMode}, ::Int) = 1
 _route_columns(::Type{TracedMPOMode}, residual_block_max::Int) = residual_block_max
 _route_columns(::Type{JointMPOMode}, ::Int) = 1
 
@@ -249,12 +275,13 @@ function _allocate_workspace(
     residual_block_max::Int,
     residual_sector_max::Int,
     qmax::Int,
-    scratch_max::Int,
+    scratch_max::Int;
+    factor_columns::Int=_route_columns(M, residual_block_max),
 ) where {M<:AbstractSamplingMode,S,T,Rprob}
     route_output = zeros(
         T,
         residual_block_max,
-        _route_columns(M, residual_block_max),
+        factor_columns,
     )
     scratch = _allocate_scratch(S, T, scratch_max)
     return SamplingWorkspace{M,T,Rprob,typeof(scratch)}(
@@ -341,9 +368,13 @@ function _apply_route_to_workspace!(
     return rows, columns
 end
 
-@inline _outcome_count(::Type{M}, plan) where {M<:PhysicalSamplingMode} =
+@inline _outcome_count(::Type{M}, plan::SitePlan) where {M<:PhysicalSamplingMode} =
     plan.physical.fulldim
-@inline _outcome_count(::Type{JointMPOMode}, plan) =
+@inline _outcome_count(::Type{M}, plan::BoundaryPlan) where {
+    M<:Union{JointMPSMode,JointMPOMode},
+} =
+    length(plan.boundary_basis)
+@inline _outcome_count(::Type{JointMPOMode}, plan::SitePlan) =
     plan.physical.fulldim * purification_dimension(plan)
 @inline _outcome_count(::SamplingWorkspace{M}, plan) where {M} =
     _outcome_count(M, plan)
@@ -358,7 +389,16 @@ end
 function _compute_weights!(
     workspace::SamplingWorkspace{M},
     C,
-    plan,
+    plan::BoundaryPlan,
+) where {M<:Union{JointMPSMode,JointMPOMode}}
+    copyto!(workspace.q, 1, plan.weights, 1, length(plan.weights))
+    return nothing
+end
+
+function _compute_weights!(
+    workspace::SamplingWorkspace{M},
+    C,
+    plan::SitePlan,
 ) where {M<:PhysicalSamplingMode}
     q = workspace.q
     dp = plan.physical.fulldim
@@ -392,7 +432,7 @@ end
 function _compute_weights!(
     workspace::SamplingWorkspace{JointMPOMode},
     C,
-    plan,
+    plan::SitePlan,
 )
     q = workspace.q
     dk = purification_dimension(plan)
@@ -582,13 +622,26 @@ function _compress_factor!(G, plan)
 end
 
 function _advance_factor!(
-    workspace::SamplingWorkspace{MPSMode},
+    workspace::SamplingWorkspace{M},
     C,
-    plan,
+    plan::SitePlan,
     selected::Int,
     qselected,
-)
+) where {M<:Union{MPSMode,JointMPSMode}}
     Cnext = _build_selected_factor!(workspace, C, plan, selected)
+    M === MPSMode && (Cnext = _compress_factor!(Cnext, plan))
+    rmul!(Cnext, inv(sqrt(qselected)))
+    return Cnext
+end
+
+function _advance_factor!(
+    workspace::SamplingWorkspace{M},
+    C,
+    plan::BoundaryPlan,
+    selected::Int,
+    qselected,
+) where {M<:Union{JointMPSMode,JointMPOMode}}
+    Cnext = _boundary_column(C, plan.residual_right, selected)
     rmul!(Cnext, inv(sqrt(qselected)))
     return Cnext
 end
@@ -602,7 +655,7 @@ end
 function _advance_factor!(
     workspace::SamplingWorkspace{JointMPOMode},
     C,
-    plan,
+    plan::SitePlan,
     selected::Int,
     qselected,
 )
@@ -617,17 +670,42 @@ end
     return length(sampler.plans)
 end
 @inline _configuration_length(sampler::BornSampler{JointMPOMode}) =
-    2 * length(sampler.plans)
+    first(sampler.plans).output_row
 
 @inline function _store_outcome!(
     ::SamplingWorkspace{M},
     configuration::AbstractVector,
     site::Int,
     chain_length::Int,
-    plan,
+    plan::SitePlan,
     selected::Int,
 ) where {M<:PhysicalSamplingMode}
     configuration[site] = selected
+    return nothing
+end
+
+@inline function _store_outcome!(
+    ::SamplingWorkspace{JointMPSMode},
+    configuration::AbstractVector,
+    site::Int,
+    chain_length::Int,
+    plan::SitePlan,
+    selected::Int,
+)
+    configuration[site - 1] = selected
+    return nothing
+end
+
+@inline function _store_outcome!(
+    ::SamplingWorkspace{JointMPSMode},
+    configuration::AbstractMatrix,
+    site::Int,
+    chain_length::Int,
+    shot::Int,
+    plan::SitePlan,
+    selected::Int,
+)
+    configuration[site - 1, shot] = selected
     return nothing
 end
 
@@ -636,12 +714,14 @@ end
     configuration::AbstractVector,
     site::Int,
     chain_length::Int,
-    plan,
+    plan::SitePlan,
     selected::Int,
 )
     x, y = _joint_coordinates(plan, selected)
-    configuration[site] = x
-    configuration[chain_length + site] = y
+    physical_site = site - 1
+    physical_length = chain_length - 1
+    configuration[physical_site] = x
+    configuration[physical_length + physical_site] = plan isa SitePlan{3} ? 0 : y
     return nothing
 end
 
@@ -651,7 +731,7 @@ end
     site::Int,
     chain_length::Int,
     shot::Int,
-    plan,
+    plan::SitePlan,
     selected::Int,
 ) where {M<:PhysicalSamplingMode}
     configuration[site, shot] = selected
@@ -664,29 +744,57 @@ end
     site::Int,
     chain_length::Int,
     shot::Int,
-    plan,
+    plan::SitePlan,
     selected::Int,
 )
     x, y = _joint_coordinates(plan, selected)
-    configuration[site, shot] = x
-    configuration[chain_length + site, shot] = y
+    physical_site = site - 1
+    physical_length = chain_length - 1
+    configuration[physical_site, shot] = x
+    configuration[physical_length + physical_site, shot] = plan isa SitePlan{3} ? 0 : y
+    return nothing
+end
+
+@inline function _store_outcome!(
+    ::SamplingWorkspace{M},
+    configuration::AbstractVector,
+    site::Int,
+    chain_length::Int,
+    plan::BoundaryPlan,
+    selected::Int,
+) where {M<:Union{JointMPSMode,JointMPOMode}}
+    configuration[plan.output_row] = selected
+    return nothing
+end
+
+@inline function _store_outcome!(
+    ::SamplingWorkspace{M},
+    configuration::AbstractMatrix,
+    site::Int,
+    chain_length::Int,
+    shot::Int,
+    plan::BoundaryPlan,
+    selected::Int,
+) where {M<:Union{JointMPSMode,JointMPOMode}}
+    configuration[plan.output_row, shot] = selected
     return nothing
 end
 
 """
     bornsample!(rng, sampler::BornSampler, config::AbstractVector{Int}) -> Float64
 
-Draw one physical configuration into the caller-owned `config` vector and
-return its log probability. For an `MPS` or an `MPO` in the default
-traced-purification mode,
-`config[i]` is the one-based flat index in site `i`'s TensorKit physical-space
-canonical basis. An `MPO` compiled with `purified=false` instead
-expects length `2L`, stores all physical indices in `config[1:L]`, all sampled
-purification indices in `config[(L + 1):(2L)]`, and returns the joint log
-probability.
+Draw one configuration into the caller-owned `config` vector and return its
+log probability. With `purified=true`, `config` has length `L` and `config[i]`
+is the one-based flat index in site `i`'s TensorKit physical-space canonical
+basis. With `purified=false`, an `MPS` expects length `L+1` in `[x; b]` order,
+and an `MPO` expects length `2L+1` in `[x; y; b]` order. A tangent uses
+`[x; optional y; b; optional q]` as described by [`BornSampler`](@ref).
+An absent purification leg contributes zero in a present `y` group; sampled
+basis indices start at one. The returned log probability includes every
+sampled index.
 
 The method mutates the caller's `config` and the sampler's reusable numerical
-workspace. It does not alter the canonicalized state tensors.
+workspace. State tensors remain unchanged.
 """
 function bornsample!(
     rng::Random.AbstractRNG,
@@ -829,10 +937,9 @@ end
 """
     bornsample!(rng, sampler::BornSampler)
 
-Draw one sample and return its physical flat-index configuration and log
-probability. Recover the ordinary probability with
-`exp(shot.log_probability)` when it is needed. The canonical-basis metadata is
-already compiled in `sampler.plans` and is not duplicated in the result.
+Draw one sample and return its flat-index configuration and log probability.
+The physical or joint layout follows [`BornSampler`](@ref). Recover the
+ordinary probability with `exp(shot.log_probability)` when it is needed.
 """
 function bornsample!(rng::Random.AbstractRNG, sampler::BornSampler)
     configuration = Vector{Int}(undef, _configuration_length(sampler))
@@ -1331,21 +1438,23 @@ end
                 ntasks=Threads.nthreads(), disk=false, maxsize=ntasks)
 
 Draw a batch of samples using layer-synchronous sampled-prefix frontiers. Within
-each site, worker tasks dynamically claim shots and independently advance them.
-A layer barrier then releases the preceding frontier before the next site
+each sampling layer, worker tasks dynamically claim shots and independently advance them.
+A layer barrier then releases the preceding frontier before the next layer
 starts. Every worker owns an independent contraction workspace, while every
 shot retains its own RNG across layers. `ntasks` is not capped by the number of
 Julia threads; Julia's scheduler multiplexes the requested tasks. The caller
 must not invoke another sampling method on the same sampler concurrently.
 
-For an `MPS` or an `MPO` in the default mode, the returned configuration matrix
-has shape `(length(state), nshots)`, with one physical configuration per
-column. For an `MPO` compiled with `purified=false`, it has shape
-`(2 * length(state), nshots)`: the first `L` rows are physical indices and the
-final `L` rows are purification indices. When `disk=true`, metadata stays in
+In the default traced mode, the returned configuration matrix has shape
+`(L, nshots)`, with one physical configuration per column. With
+`purified=false`, an `MPS` returns `(L+1, nshots)` in `[x; b]` order, and an
+`MPO` returns `(2L+1, nshots)` in `[x; y; b]` order. A tangent uses the
+rank-dependent `[x; optional y; b; optional q]` layout of [`BornSampler`](@ref).
+An absent local purification leg contributes zero in a present `y` group.
+When `disk=true`, metadata stays in
 memory while larger node environments in each frontier are managed by a strict
 probability top-`maxsize` resident cache and raw temporary files. An MPS or
-joint-MPO node stores one normalized collapsed factor. A traced-MPO node instead
+joint-MPO node stores one propagated factor. A traced-MPO node instead
 stores the complete bank of uncompressed next-physical-outcome factors; an
 outcome is moved out of that bank and compressed only when its child edge is
 first used. A tangent batch additionally builds one q-resolved right suffix
@@ -1480,8 +1589,7 @@ function bornsample!(
 end
 
 """
-    bornsample!(rng, state::Union{FiniteMPS.MPS,FiniteMPS.MPO};
-                left_boundary=nothing, purified=true)
+    bornsample!(rng, state::Union{FiniteMPS.MPS,FiniteMPS.MPO}; purified=true)
 
 Compile `state` and draw one sample. This convenience method modifies the
 input state's canonical gauge. Reuse a `BornSampler` for repeated shots.
