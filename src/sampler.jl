@@ -1078,6 +1078,26 @@ function _build_prefix_child!(
     selected::Int,
     site::Int,
 ) where {T,R,F}
+    return _build_prefix_child_from_factor!(
+        sampler,
+        workspace,
+        _prefix_factor(current_cache, parent.id),
+        next_cache,
+        parent,
+        selected,
+        site,
+    )
+end
+
+function _build_prefix_child_from_factor!(
+    sampler::BornSampler,
+    workspace::SamplingWorkspace,
+    parent_factor::F,
+    next_cache::PrefixCache{T,R,F,F},
+    parent::PrefixNode,
+    selected::Int,
+    site::Int,
+) where {T,R,F}
     plan = sampler.plans[site]
     qselected = parent.q[selected]
     z = _total_weight(parent.q, length(parent.q), site)
@@ -1085,7 +1105,6 @@ function _build_prefix_child!(
         parent.log_probability + (log(qselected) - log(z))
     child_id = _allocate_node_id!(next_cache)
 
-    parent_factor = _prefix_factor(current_cache, parent.id)
     factor = _advance_factor!(
         workspace,
         parent_factor,
@@ -1166,6 +1185,26 @@ function _get_or_build_prefix_child!(
     site::Int,
     next_completion,
 )
+    return _get_or_build_prefix_child!(next_cache, parent, selected) do
+        _build_prefix_child_with_completion!(
+            sampler,
+            workspace,
+            current_cache,
+            next_cache,
+            parent,
+            selected,
+            site,
+            next_completion,
+        )
+    end
+end
+
+function _get_or_build_prefix_child!(
+    build_child::B,
+    next_cache::PrefixCache,
+    parent::PrefixNode,
+    selected::Int,
+) where {B}
     slot = parent.children[selected]
     child_id = _child_id(slot)
     iszero(child_id) || return _published_prefix_node(next_cache, child_id)
@@ -1174,16 +1213,7 @@ function _get_or_build_prefix_child!(
     try
         child_id = _child_id(slot)
         if iszero(child_id)
-            child = _build_prefix_child_with_completion!(
-                sampler,
-                workspace,
-                current_cache,
-                next_cache,
-                parent,
-                selected,
-                site,
-                next_completion,
-            )
+            child = build_child()
             # The node and its complete resident/disk environment become
             # visible before the release publication of this child id.
             _publish_child_id!(slot, child.id)
@@ -1332,6 +1362,71 @@ function _finish_cached_layer_shot!(
     return nothing
 end
 
+_cold_parent_groups(::PrefixCache, ::Vector{Int}, ::Int, completion) = nothing
+
+function _cold_parent_groups(
+    cache::PrefixCache{T,R,F,F},
+    current_node_ids::Vector{Int},
+    nshots::Int,
+    ::NoCompletion,
+) where {T,R,F}
+    cache.directory === nothing && return nothing
+    parent_count = cache.next_node_id[]
+    length(cache.resident) == parent_count && return nothing
+
+    # Each warm shot is a job; each cold parent contributes only its first shot.
+    # The remaining shots form a forward chain owned by that job's worker.
+    jobs = Int[]
+    tails = zeros(Int, parent_count)
+    next_shots = zeros(Int, nshots)
+    @inbounds for shot in 1:nshots
+        parent_id = current_node_ids[shot]
+        if haskey(cache.resident, parent_id)
+            push!(jobs, shot)
+        else
+            tail = tails[parent_id]
+            if iszero(tail)
+                push!(jobs, shot)
+            else
+                next_shots[tail] = shot
+            end
+            tails[parent_id] = shot
+        end
+    end
+    return (; jobs, next_shots)
+end
+
+function _advance_cold_parent_group!(
+    shot_rngs,
+    sampler::BornSampler,
+    workspace::SamplingWorkspace,
+    current_cache::PrefixCache{T,R,F,F},
+    next_cache::PrefixCache{T,R,F,F},
+    current_node_ids::Vector{Int},
+    next_node_ids::Vector{Int},
+    configuration::Matrix{Int},
+    site::Int,
+    shot::Int,
+    next_shots::Vector{Int},
+) where {T,R,F}
+    parent = _published_prefix_node(current_cache, current_node_ids[shot])
+    parent_factor = _prefix_factor(current_cache, parent.id)
+    while !iszero(shot)
+        _, selected, _ = _draw_cached_outcome!(
+            shot_rngs[shot], sampler, workspace, current_cache,
+            current_node_ids, configuration, shot, site,
+        )
+        child = _get_or_build_prefix_child!(next_cache, parent, selected) do
+            _build_prefix_child_from_factor!(
+                sampler, workspace, parent_factor, next_cache, parent, selected, site,
+            )
+        end
+        @inbounds next_node_ids[shot] = child.id
+        @inbounds shot = next_shots[shot]
+    end
+    return nothing
+end
+
 function _advance_cached_layer!(
     shot_rngs,
     sampler::BornSampler,
@@ -1345,13 +1440,33 @@ function _advance_cached_layer!(
     worker_count::Int,
     next_completion,
 )
-    next_shot = Threads.Atomic{Int}(1)
+    groups = _cold_parent_groups(current_cache, current_node_ids, nshots, next_completion)
+    job_count = groups === nothing ? nshots : length(groups.jobs)
+    next_job = Threads.Atomic{Int}(1)
     Threads.@sync for worker_id in 1:worker_count
         Threads.@spawn begin
             workspace = sampler.workspaces[worker_id]
             while true
-                shot = Threads.atomic_add!(next_shot, 1)
-                shot > nshots && break
+                job = Threads.atomic_add!(next_job, 1)
+                job > job_count && break
+                shot = groups === nothing ? job : groups.jobs[job]
+                if groups !== nothing &&
+                   !haskey(current_cache.resident, current_node_ids[shot])
+                    _advance_cold_parent_group!(
+                        shot_rngs,
+                        sampler,
+                        workspace,
+                        current_cache,
+                        next_cache,
+                        current_node_ids,
+                        next_node_ids,
+                        configuration,
+                        site,
+                        shot,
+                        groups.next_shots,
+                    )
+                    continue
+                end
                 _advance_cached_layer_shot!(
                     shot_rngs[shot],
                     sampler,
@@ -1438,7 +1553,8 @@ end
                 ntasks=Threads.nthreads(), disk=false, maxsize=ntasks)
 
 Draw a batch of samples using layer-synchronous sampled-prefix frontiers. Within
-each sampling layer, worker tasks dynamically claim shots and independently advance them.
+each sampling layer, worker tasks dynamically claim shots, grouped by
+nonresident parent for MPS and joint-MPO batches.
 A layer barrier then releases the preceding frontier before the next layer
 starts. Every worker owns an independent contraction workspace, while every
 shot retains its own RNG across layers. `ntasks` is not capped by the number of

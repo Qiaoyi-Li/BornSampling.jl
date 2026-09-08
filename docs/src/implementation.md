@@ -297,10 +297,12 @@ probability, next-site branch weights, and environment tensor. When multiple
 shots follow the same prefix path, they share the node's branch weights and
 environment.
 
-Within each layer, shots are assigned to worker tasks via an atomic counter.
-Each worker operates with its own contraction workspace, and per-shot random
-number generators are seeded upfront to ensure reproducibility regardless of
-task scheduling.
+Within each layer, an atomic counter assigns work to worker tasks. In MPS and
+joint-MPO batches, shots sharing a nonresident parent form one job so its factor
+is loaded once for the group; shots with resident parents remain individual
+jobs. Each worker operates with its own contraction workspace, and per-shot
+random number generators are seeded upfront to ensure reproducibility
+regardless of task scheduling.
 
 When all shots complete a layer, the next frontier becomes active and the
 preceding frontier is released. Child nodes are published with fine-grained

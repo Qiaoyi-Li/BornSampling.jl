@@ -1,3 +1,16 @@
+# Count logical reads only while a selected source frontier is read-only.
+# Destination writes use another cache, and the normal path method remains the
+# implementation under test. No production counters or codec replacement.
+const prefix_read_probe = Ref{Any}(nothing)
+
+function BS._factor_path(cache::BS.PrefixCache{T,R,F,F}, id::Int) where {T,R,F}
+    probe = prefix_read_probe[]
+    if probe !== nothing && cache === probe.cache
+        Threads.atomic_add!(probe.counts[id], 1)
+    end
+    return invoke(BS._factor_path, Tuple{BS.PrefixCache,Int}, cache, id)
+end
+
 @testset "batched prefix-tree sampling" begin
     @testset "output layout, validation, and deterministic scheduling" begin
         sampler3 = BS.BornSampler(rank3_state(length=4, bonddim=3))
@@ -163,6 +176,133 @@
                 rtol=3e-11,
                 atol=5e-13,
             )
+        end
+    end
+
+    @testset "cold parents load once for different children" begin
+        fixtures = (
+            (rank3_state(length=3, bonddim=2), true),
+            (rank3_state(length=3, bonddim=2), false),
+            (mixed_rank_three_site_mpo_state(), false),
+        )
+        for (state, purified) in fixtures
+            # Deterministic positive amplitudes keep both outcomes appreciable
+            # while allowing different parents to have different factors.
+            tensors = map(1:length(state)) do site
+                A = copy(state[site].A)
+                for entry in eachindex(A.data)
+                    A.data[entry] = 1 + ((entry + site) % 7) / 10
+                end
+                FiniteMPS.MPSTensor(A)
+            end
+            state = state isa FiniteMPS.MPS ? FiniteMPS.MPS(tensors) : FiniteMPS.MPO(tensors)
+            for worker_count in (1, Threads.nthreads() + 2)
+                sampler = BS.BornSampler(deepcopy(state); purified)
+                BS._ensure_workspaces!(sampler, worker_count)
+                workspace = first(sampler.workspaces)
+                F, R = typeof(sampler.initial_factor), eltype(workspace.q)
+                caches = BS.PrefixCache[]
+                function new_cache(capacity; disk=false)
+                    cache = BS._new_prefix_cache(F, R, capacity; disk, maxsize=1)
+                    push!(caches, cache)
+                    return cache
+                end
+                try
+                    current = new_cache(1)
+                    parent = BS._initialize_prefix_cache!(sampler, workspace, current)
+                    site = 1
+                    # Joint modes draw their synthetic boundary before the
+                    # first physical site, even when that boundary has size one.
+                    if sampler.plans[site] isa BS.BoundaryPlan
+                        boundary_children = new_cache(length(parent.q))
+                        parent = BS._get_or_build_prefix_child!(
+                            sampler, workspace, current, boundary_children,
+                            parent, argmax(parent.q), site,
+                        )
+                        current = boundary_children
+                        site += 1
+                    end
+                    source = new_cache(length(parent.q); disk=true)
+                    parents = [BS._get_or_build_prefix_child!(
+                        sampler, workspace, current, source, parent, selected, site,
+                    ) for selected in findall(>(zero(R)), parent.q)]
+                    site += 1
+                    @test length(parents) >= 2
+                    @test length(source.resident) == 1
+                    resident_ids = Set(keys(source.resident))
+                    cold_ids = setdiff(Set(node.id for node in parents), resident_ids)
+                    @test !isempty(cold_ids)
+                    originals = Dict(node.id => copy(BS._prefix_factor(source, node.id))
+                                     for node in parents)
+                    current_ids = repeat([node.id for node in parents], 32)
+                    nshots = length(current_ids)
+                    target = new_cache(nshots)
+                    next_ids = zeros(Int, nshots)
+                    configuration = zeros(Int, BS._configuration_length(sampler), nshots)
+                    expected_configuration = copy(configuration)
+                    shot_rngs = [Random.Xoshiro(shot) for shot in 1:nshots]
+                    reference_rngs = copy.(shot_rngs)
+                    reference_workspace = BS._clone_workspace(workspace)
+                    expected_selected = Vector{Int}(undef, nshots)
+                    expected_q = Vector{Vector{R}}(undef, nshots)
+                    expected_log = Vector{R}(undef, nshots)
+                    for shot in 1:nshots
+                        node, selected, z = BS._draw_cached_outcome!(
+                            reference_rngs[shot], sampler, reference_workspace,
+                            source, current_ids, expected_configuration, shot, site,
+                        )
+                        expected_selected[shot] = selected
+                        factor = BS._advance_factor!(
+                            reference_workspace, originals[node.id],
+                            sampler.plans[site], selected, node.q[selected],
+                        )
+                        BS._compute_weights!(
+                            reference_workspace, factor, sampler.plans[site + 1],
+                        )
+                        count = BS._outcome_count(reference_workspace, sampler.plans[site + 1])
+                        expected_q[shot] = BS._copy_active_weights(reference_workspace, count)
+                        expected_log[shot] = node.log_probability +
+                                             (log(node.q[selected]) - log(z))
+                    end
+                    for id in cold_ids
+                        @test length(unique(expected_selected[current_ids .== id])) >= 2
+                    end
+                    counts = [Threads.Atomic{Int}(0) for _ in source.nodes]
+                    prefix_read_probe[] = (; cache=source, counts)
+                    try
+                        BS._advance_cached_layer!(
+                            shot_rngs, sampler, source, target, current_ids, next_ids,
+                            configuration, site, nshots, worker_count,
+                        )
+                    finally
+                        prefix_read_probe[] = nothing
+                    end
+                    @test all(id -> counts[id][] == 1, cold_ids)
+                    @test all(id -> counts[id][] == 0, resident_ids)
+                    @test Set(keys(source.resident)) == resident_ids
+                    @test all(node -> BS._prefix_factor(source, node.id) == originals[node.id], parents)
+                    @test configuration == expected_configuration
+                    @test rand.(shot_rngs, UInt64) == rand.(reference_rngs, UInt64)
+                    edges = Dict{Tuple{Int,Int},Int}()
+                    for shot in 1:nshots
+                        edge = (current_ids[shot], expected_selected[shot])
+                        id = next_ids[shot]
+                        @test id == get!(edges, edge, id)
+                        child = BS._published_prefix_node(target, id)
+                        @test child.q == expected_q[shot]
+                        @test child.log_probability == expected_log[shot]
+                        node = BS._published_prefix_node(source, current_ids[shot])
+                        @test BS._child_id(node.children[expected_selected[shot]]) == id
+                    end
+                    @test target.next_node_id[] == length(edges)
+                    @test length(edges) < nshots
+                finally
+                    prefix_read_probe[] = nothing
+                    for cache in reverse(caches)
+                        BS._cleanup_prefix_cache!(cache)
+                    end
+                end
+            end
         end
     end
 
