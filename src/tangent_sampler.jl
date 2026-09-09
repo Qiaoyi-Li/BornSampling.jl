@@ -46,20 +46,15 @@ TangentBlockMatrix{T}() where {T} = TangentBlockMatrix{T}(
     Dict{NTuple{2,Int},Int}(),
 )
 
-"""One residual input/output block of a fixed local-basis channel."""
-struct TangentChannelBlock{T}
-    left_slot::Int
-    right_slot::Int
-    data::Matrix{T}
-end
-
 """
-The q-resolved suffix Gram layers for a tangent prefix.
+The residual suffix Gram layers used by the forward sampling pass.
 
-The fields are `I = R'R`, `K_q = R'T_q`, and `N_q = T_q'T_q`. Each quadratic
-map stores only its compatible residual-sector pairs; in particular, `K_q` may
-contain off-diagonal sector pairs carrying the fixed q charge. The q family is
-kept as a vector and is never fused with a virtual space.
+The fields are `I = R'R`, `K_q = R'T_q`, and either the single traced matrix
+`sum_q T_q'T_q` or the joint family `N_q = T_q'T_q`. Each quadratic map stores
+only its compatible residual-sector pairs; in particular, `K_q` may contain
+off-diagonal sector pairs carrying the fixed q charge. Each completed suffix is
+converted to these maps for storage while the right sweep continues using its
+original-symmetry TensorMaps.
 """
 struct TangentCompletionMetric{T}
     ranges::Vector{UnitRange{Int}}
@@ -83,9 +78,6 @@ mutable struct TangentSamplingWorkspace{
     M<:AbstractSamplingMode,T,R,Scratch,
 }
     q::Vector{R}
-    route_output::Matrix{T}
-    identity::Matrix{T}
-    matrix_scratch::Matrix{T}
     factor_scratch::Matrix{T}
     scratch::Scratch
 end
@@ -359,9 +351,6 @@ function _allocate_tangent_workspace(
     scratch = _allocate_scratch(S, T, maximum_scratch)
     return TangentSamplingWorkspace{M,T,R,typeof(scratch)}(
         zeros(R, qmax),
-        zeros(T, maximum_block, maximum_block),
-        zeros(T, maximum_block, maximum_block),
-        zeros(T, maximum_block, maximum_block),
         zeros(T, maximum_block, maximum_history),
         scratch,
     )
@@ -373,60 +362,9 @@ function _clone_workspace(
     scratch = _zero_like(workspace.scratch)
     return TangentSamplingWorkspace{M,T,R,typeof(scratch)}(
         zeros(R, length(workspace.q)),
-        zeros(T, size(workspace.route_output)),
-        zeros(T, size(workspace.identity)),
-        zeros(T, size(workspace.matrix_scratch)),
         zeros(T, size(workspace.factor_scratch)),
         scratch,
     )
-end
-
-# The quadratic right sweep uses the same compiled `ChannelRoute`s as the
-# prefix hot path, but materializes each nonzero residual block separately.
-# No matrix with the full concatenated residual dimension is formed.
-function _materialize_block_channel(
-    workspace::TangentSamplingWorkspace{M,T},
-    plan::SitePlan,
-    physical::BasisInfo,
-    purification,
-) where {M,T}
-    blocks = TangentChannelBlock{T}[]
-    for route in _channel_routes(plan, physical, purification)
-        rows = plan.residual_right.dimensions[route.right_slot]
-        columns = plan.residual_left.dimensions[route.left_slot]
-        identity = view(workspace.identity, 1:columns, 1:columns)
-        fill!(identity, zero(T))
-        @inbounds for diagonal in 1:columns
-            identity[diagonal, diagonal] = one(T)
-        end
-        route_output = view(workspace.route_output, 1:rows, 1:columns)
-        fill!(route_output, zero(T))
-        _apply_route!(
-            route_output,
-            identity,
-            plan,
-            route,
-            physical,
-            purification,
-            workspace.scratch,
-        )
-        push!(blocks, TangentChannelBlock{T}(
-            route.left_slot,
-            route.right_slot,
-            Matrix(route_output),
-        ))
-    end
-    return blocks
-end
-
-@inline function _tangent_block(
-    matrix::TangentBlockMatrix,
-    row_slot::Int,
-    column_slot::Int,
-)
-    slot = get(matrix.index, (row_slot, column_slot), 0)
-    iszero(slot) && return nothing
-    return @inbounds matrix.blocks[slot]
 end
 
 function _tangent_destination_block!(
@@ -447,74 +385,6 @@ function _tangent_destination_block!(
     return @inbounds matrix.blocks[slot]
 end
 
-@inline _tangent_middle_block(
-    matrix::TangentBlockMatrix,
-    row_slot::Int,
-    column_slot::Int,
-    ::Val{false},
-) = _tangent_block(matrix, row_slot, column_slot)
-
-@inline function _tangent_middle_block(
-    matrix::TangentBlockMatrix,
-    row_slot::Int,
-    column_slot::Int,
-    ::Val{true},
-)
-    block = _tangent_block(matrix, column_slot, row_slot)
-    return block === nothing ? nothing : adjoint(block)
-end
-
-function _add_completion_transfer!(
-    destination::TangentBlockMatrix{T},
-    bra_channel::Vector{TangentChannelBlock{T}},
-    middle::TangentBlockMatrix{T},
-    ket_channel::Vector{TangentChannelBlock{T}},
-    workspace::TangentSamplingWorkspace{M,T},
-    middle_adjoint::Val{A},
-) where {M,T,A}
-    for bra in bra_channel, ket in ket_channel
-        middle_block = _tangent_middle_block(
-            middle,
-            bra.right_slot,
-            ket.right_slot,
-            middle_adjoint,
-        )
-        middle_block === nothing && continue
-        result = _tangent_destination_block!(
-            destination,
-            bra.left_slot,
-            ket.left_slot,
-            size(bra.data, 2),
-            size(ket.data, 2),
-        )
-        temporary = view(
-            workspace.matrix_scratch,
-            1:size(bra.data, 2),
-            1:size(middle_block, 2),
-        )
-        mul!(temporary, adjoint(bra.data), middle_block)
-        mul!(result, temporary, ket.data, one(T), one(T))
-    end
-    return nothing
-end
-
-@inline function _add_completion_transfer!(
-    destination::TangentBlockMatrix{T},
-    bra_channel::Vector{TangentChannelBlock{T}},
-    middle::TangentBlockMatrix{T},
-    ket_channel::Vector{TangentChannelBlock{T}},
-    workspace::TangentSamplingWorkspace{M,T},
-) where {M,T}
-    return _add_completion_transfer!(
-        destination,
-        bra_channel,
-        middle,
-        ket_channel,
-        workspace,
-        Val(false),
-    )
-end
-
 function _tangent_residual_ranges(dimensions)
     ranges = Vector{UnitRange{Int}}(undef, length(dimensions))
     first_row = 1
@@ -524,139 +394,6 @@ function _tangent_residual_ranges(dimensions)
         first_row = last_row + 1
     end
     return ranges
-end
-
-function _retreat_completion_metric(
-    step::TangentLocalPlan,
-    metric::TangentCompletionMetric{T},
-    workspace::TangentSamplingWorkspace{M,T},
-) where {M,T}
-    symmetry_dimension = length(step.symmetry_basis)
-    inserted = TangentBlockMatrix{T}()
-    cross = [TangentBlockMatrix{T}() for _ in 1:symmetry_dimension]
-    uninserted = [TangentBlockMatrix{T}() for _ in 1:symmetry_dimension]
-
-    for physical in step.left.physical_basis
-        for local_index in eachindex(step.local_purification_basis)
-            left_channel = _materialize_block_channel(
-                workspace,
-                step.left,
-                physical,
-                _base_auxiliary(step.left, local_index),
-            )
-            right_channel = _materialize_block_channel(
-                workspace,
-                step.right,
-                physical,
-                _base_auxiliary(step.right, local_index),
-            )
-            _add_completion_transfer!(
-                inserted,
-                right_channel,
-                metric.inserted,
-                right_channel,
-                workspace,
-            )
-
-            for symmetry_index in eachindex(step.symmetry_basis)
-                insertion_channel = _materialize_block_channel(
-                    workspace,
-                    step.insertion,
-                    physical,
-                    _insertion_auxiliary(
-                        step.left,
-                        step.insertion,
-                        local_index,
-                        symmetry_index,
-                    ),
-                )
-                metric_cross = metric.cross[symmetry_index]
-                metric_uninserted = metric.uninserted[symmetry_index]
-
-                # K'_q = R' I B_q + R' K_q L.
-                _add_completion_transfer!(
-                    cross[symmetry_index],
-                    right_channel,
-                    metric.inserted,
-                    insertion_channel,
-                    workspace,
-                )
-                _add_completion_transfer!(
-                    cross[symmetry_index],
-                    right_channel,
-                    metric_cross,
-                    left_channel,
-                    workspace,
-                )
-
-                # Same-site B'I B occurs once. The two K terms are the two
-                # orientations of every different-site cross term.
-                _add_completion_transfer!(
-                    uninserted[symmetry_index],
-                    left_channel,
-                    metric_uninserted,
-                    left_channel,
-                    workspace,
-                )
-                _add_completion_transfer!(
-                    uninserted[symmetry_index],
-                    insertion_channel,
-                    metric.inserted,
-                    insertion_channel,
-                    workspace,
-                )
-                _add_completion_transfer!(
-                    uninserted[symmetry_index],
-                    insertion_channel,
-                    metric_cross,
-                    left_channel,
-                    workspace,
-                )
-                _add_completion_transfer!(
-                    uninserted[symmetry_index],
-                    left_channel,
-                    metric_cross,
-                    insertion_channel,
-                    workspace,
-                    Val(true),
-                )
-            end
-        end
-    end
-    return TangentCompletionMetric(
-        _tangent_residual_ranges(step.left.residual_left.dimensions),
-        inserted,
-        cross,
-        uninserted,
-    )
-end
-
-function _right_boundary_metric(::Type{T}, step::TangentLocalPlan) where {T}
-    residual = step.right.residual_right
-    dimension = _residual_dimension(residual)
-    dimension == 1 || throw(ArgumentError(
-        "the final right virtual space must be one-dimensional",
-    ))
-    inserted = TangentBlockMatrix{T}()
-    for (slot, block_dimension) in pairs(residual.dimensions)
-        block = _tangent_destination_block!(
-            inserted,
-            slot,
-            slot,
-            block_dimension,
-            block_dimension,
-        )
-        @inbounds for diagonal in 1:block_dimension
-            block[diagonal, diagonal] = one(T)
-        end
-    end
-    symmetry_dimension = length(step.symmetry_basis)
-    return TangentCompletionMetric(
-        _tangent_residual_ranges(residual.dimensions),
-        inserted,
-        [TangentBlockMatrix{T}() for _ in 1:symmetry_dimension],
-        [TangentBlockMatrix{T}() for _ in 1:symmetry_dimension],
-    )
 end
 
 """Initialize separate full-boundary history columns with U = I/√dim(b) and V = 0."""
@@ -726,7 +463,9 @@ end
 Compile the Hilbert-space state represented by a finite-MPS tangent vector.
 The state is the coherent sum over all single-insertion sites. Construction
 compiles symmetry-aware local routes, while every nonempty sampling batch owns
-one right-to-left completion sweep and releases it at batch completion.
+one right-to-left completion sweep in the original symmetry. Each completed
+suffix is converted to residual-sector sampling blocks for storage, while the
+sweep continues with the original-symmetry tensors before forward sampling.
 
 With `purified=true`, the full left boundary, local purification legs, and
 global q are traced, returning `L` physical indices. With `purified=false`,
@@ -825,12 +564,12 @@ function _begin_sampling_run(
     disk::Bool,
 ) where {M<:TangentSamplingMode}
     steps = _tangent_local_steps(sampler)
-    workspace = first(sampler.workspaces)
-    completion = _right_boundary_metric(
-        eltype(workspace.route_output),
-        last(steps),
-    )
-    C = typeof(completion)
+    T = eltype(sampler.initial_factor.uninserted)
+    completion = _right_symmetric_tangent_completion(T, sampler.state, M)
+    C = TangentCompletionMetric{T}
+    # Store only the residual representation used by sampling. The running
+    # right environment retains the original symmetry and is never replaced by
+    # the converted value before its next transfer.
     store = TangentCompletionStore{C}(length(steps); disk=disk)
     try
         root_count = _tangent_root_count(sampler)
@@ -839,14 +578,29 @@ function _begin_sampling_run(
             # Their site completions are stored by local index. Traced sampling
             # keeps the first site's completion in RAM and stores sites 2:L.
             if site > 1 || root_count > 0
-                _put_completion!(store, site, completion)
-                completion = _retreat_completion_metric(
-                    steps[site],
+                _put_completion!(
+                    store,
+                    site,
+                    _residual_tangent_completion(completion, steps[site], M; side=:right),
+                )
+                completion = _retreat_symmetric_tangent_completion(
                     completion,
-                    workspace,
+                    sampler.state.base.Al[site],
+                    sampler.state.base.Ar[site],
+                    sampler.state.B[site],
+                    M,
                 )
             end
         end
+
+        # The root is the final conversion. Forward sampling starts only after
+        # this function returns, when every required suffix is ready.
+        completion = _residual_tangent_completion(
+            completion,
+            first(steps),
+            M;
+            side=root_count > 0 ? :left : :right,
+        )
         return TangentSamplingRun{C,typeof(store)}(
             store,
             completion,
@@ -1085,15 +839,27 @@ function _tangent_completion_weight(
 ) where {M,T}
     value = zero(T)
 
-    for (axis, symmetry_index) in pairs(factor.symmetry_indices)
-        inserted = view(factor.inserted, :, axis, :)
+    if M === TracedTangentMode
         value += _tangent_block_bilinear(
             workspace,
             factor.uninserted,
-            metric.uninserted[symmetry_index],
+            only(metric.uninserted),
             factor.uninserted,
             metric.ranges,
         )
+    end
+
+    for (axis, symmetry_index) in pairs(factor.symmetry_indices)
+        inserted = view(factor.inserted, :, axis, :)
+        if M === JointTangentMode
+            value += _tangent_block_bilinear(
+                workspace,
+                factor.uninserted,
+                metric.uninserted[symmetry_index],
+                factor.uninserted,
+                metric.ranges,
+            )
+        end
         value += _tangent_block_bilinear(
             workspace,
             inserted,

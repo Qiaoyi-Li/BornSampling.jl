@@ -53,6 +53,20 @@ function tangent_nonabelian_base_state()
     return state
 end
 
+"Two SU(2) purification sites with singlet and triplet internal fusion channels."
+function tangent_nonabelian_operator_base_state()
+    physical = FiniteMPS.SU2Spin.pspace
+    boundary = TK.Rep[TK.SU₂](0 => 1)
+    virtual = TK.Rep[TK.SU₂](0 => 1, 1 => 1)
+    rng = MersenneTwister(0x7479_7375)
+    state = FiniteMPS.MPO(FiniteMPS.MPSTensor.([
+        TK.randn(rng, ComplexF64, ⊗(boundary, physical), ⊗(physical, virtual)),
+        TK.randn(rng, ComplexF64, ⊗(virtual, physical), ⊗(physical, boundary)),
+    ]))
+    FiniteMPS.canonicalize!(state, 1)
+    return state
+end
+
 "Rank-three first site, real dimension-one y at site 2, and dimension-two y at site 3."
 function tangent_mixed_rank_base_state()
     physical = FiniteMPS.NoSymSpinOneHalf.pspace
@@ -122,6 +136,83 @@ function dense_tangent_boundary_weights(state; purified=true, coherent=true)
         purified && (weights[Tuple(physical)] = physical_weight)
     end
     return weights
+end
+
+"Dense suffix Gram operators with both independent q indices retained."
+function dense_tangent_suffix_grams(state, cut)
+    left = [convert(Array, tensor.A) for tensor in state.base.Al]
+    right = [convert(Array, tensor.A) for tensor in state.base.Ar]
+    insertion = [convert(Array, tensor.A) for tensor in state.B]
+    has_q = ndims(first(insertion)) == ndims(first(left)) + 1
+    Q = has_q ? size(first(insertion), ndims(first(insertion)) - 1) : 1
+    D = cut == 0 ? size(first(left), 1) : size(left[cut], ndims(left[cut]))
+    sites = (cut + 1):length(left)
+    physical_dimensions = [size(left[site], 2) for site in sites]
+    local_dimensions = [ndims(left[site]) == 4 ? size(left[site], 3) : 1 for site in sites]
+    inserted = zeros(ComplexF64, D, D)
+    cross = zeros(ComplexF64, D, D, Q)
+    uninserted = zeros(ComplexF64, D, D, Q, Q)
+    for physical in all_configurations(physical_dimensions), local_indices in all_configurations(local_dimensions)
+        function suffix(inserted_site, q)
+            amplitude = Matrix{ComplexF64}(I, D, D)
+            for (offset, site) in enumerate(sites)
+                tensor = site == inserted_site ? insertion[site] :
+                         site < inserted_site ? left[site] : right[site]
+                indices = (Colon(), physical[offset])
+                ndims(left[site]) == 4 && (indices = (indices..., local_indices[offset]))
+                site == inserted_site && has_q && (indices = (indices..., q))
+                amplitude = transpose(view(tensor, indices..., Colon())) * amplitude
+            end
+            return amplitude
+        end
+        R = suffix(0, 1)
+        T = [sum((suffix(site, q) for site in sites); init=zeros(ComplexF64, size(R))) for q in 1:Q]
+        inserted .+= adjoint(R) * R
+        for q in 1:Q
+            cross[:, :, q] .+= adjoint(R) * T[q]
+            for qprime in 1:Q
+                uninserted[:, :, q, qprime] .+= adjoint(T[q]) * T[qprime]
+            end
+        end
+    end
+    return (; inserted, cross, uninserted)
+end
+
+function dense_tangent_block_matrix(matrix, ranges)
+    dimension = sum(length, ranges)
+    dense = zeros(ComplexF64, dimension, dimension)
+    for (key, block) in zip(matrix.keys, matrix.blocks)
+        dense[ranges[key[1]], ranges[key[2]]] .= block
+    end
+    return dense
+end
+
+function test_tangent_residual_completion(metric, dense, plan; side, purified)
+    full = side === :left ? plan.left : plan.right
+    residual = side === :left ? plan.residual_left : plan.residual_right
+    order = zeros(Int, full.fulldim)
+    for (slot, sector) in enumerate(full.sectors)
+        embedding = residual.embeddings[slot]
+        order[metric.ranges[embedding.residual_slot][embedding.rows]] .= TK.axes(full.space, sector)
+    end
+    @test sort(order) == collect(1:full.fulldim)
+    @test dense_tangent_block_matrix(metric.inserted, metric.ranges) ≈
+          dense.inserted[order, order] rtol=3e-11 atol=3e-13
+    for q in eachindex(metric.cross)
+        @test dense_tangent_block_matrix(metric.cross[q], metric.ranges) ≈
+              dense.cross[order, order, q] rtol=3e-11 atol=3e-13
+    end
+    @test length(metric.uninserted) == (purified ? 1 : size(dense.cross, 3))
+    if purified
+        traced = sum(dense.uninserted[:, :, q, q] for q in axes(dense.cross, 3))
+        @test dense_tangent_block_matrix(only(metric.uninserted), metric.ranges) ≈
+              traced[order, order] rtol=3e-11 atol=3e-13
+    else
+        for q in eachindex(metric.uninserted)
+            @test dense_tangent_block_matrix(metric.uninserted[q], metric.ranges) ≈
+                  dense.uninserted[order, order, q, q] rtol=3e-11 atol=3e-13
+        end
+    end
 end
 
 "Force external `[x..., optional y..., b, optional q]` using the sampler's draw order."
@@ -445,6 +536,135 @@ end
                 empty_batch = BS.bornsample!(MersenneTwister(seed), sampler, 0; disk=true, maxsize=1)
                 @test size(empty_batch.configuration) == (expected_length, 0)
                 @test isempty(empty_batch.log_probability)
+            end
+        end
+    end
+
+    @testset "multi-site non-Abelian local and global auxiliary legs" begin
+        product_sector = TK.Irrep[TK.:×(TK.U₁, TK.SU₂)]
+        product_source = residual_route_rank4_state()
+        FiniteMPS.canonicalize!(product_source, 1)
+        for (source, symmetry) in (
+            (tangent_nonabelian_operator_base_state(), TK.Rep[TK.SU₂](1 => 1)),
+            (product_source, TK.GradedSpace(
+                product_sector(0, 1) => 1,
+                product_sector(1, 1 // 2) => 1,
+            )),
+        )
+            tangent = tangent_with_persistent_symmetry(
+                FiniteMPSTangents.BaseMPS(source), symmetry;
+                seed=0x7479_7172,
+            )
+            @test BS._tensor_rank.(tangent.base.Al) == [4, 4]
+            @test BS._tensor_rank.(tangent.B) == [5, 5]
+            traced = normalize_weights!(dense_tangent_boundary_weights(tangent))
+            joint = normalize_weights!(dense_tangent_boundary_weights(tangent; purified=false))
+            incoherent = normalize_weights!(dense_tangent_boundary_weights(tangent; coherent=false))
+            @test maximum(abs(traced[key] - incoherent[key]) for key in keys(traced)) > 1e-5
+            for (physical, probability) in traced
+                @test sum(weight for (key, weight) in joint if key[1:2] == physical) ≈
+                      probability rtol=3e-11 atol=3e-13
+            end
+            for purified in (true, false)
+                sampler = BS.BornSampler(tangent; purified)
+                reference = purified ? traced : joint
+                # Exercise every supported output, including correlations
+                # between the sampled q and both local purification legs.
+                for (target_key, probability) in reference
+                    probability <= 1e-15 && continue
+                    target = collect(target_key)
+                    sample = BS.bornsample!(
+                        SequenceRNG(uniforms_for_tangent_configuration(
+                            reference, target, tangent; purified,
+                        )),
+                        sampler,
+                    )
+                    @test sample.configuration == target
+                    @test exp(sample.log_probability) ≈ probability rtol=3e-11 atol=3e-13
+                end
+                memory = BS.bornsample!(MersenneTwister(0x7479_6261), sampler, 24; ntasks=1)
+                disk = BS.bornsample!(
+                    MersenneTwister(0x7479_6261), sampler, 24;
+                    disk=true, maxsize=1, ntasks=Threads.nthreads() + 2,
+                )
+                @test disk == memory
+                for shot in eachindex(memory.log_probability)
+                    @test exp(memory.log_probability[shot]) ≈
+                          reference[Tuple(@view memory.configuration[:, shot])] rtol=3e-11 atol=3e-13
+                end
+            end
+        end
+    end
+
+    @testset "original-symmetry suffixes and complete conversion before sampling" begin
+        nonabelian_base = FiniteMPSTangents.BaseMPS(tangent_nonabelian_base_state())
+        product_sector = TK.Irrep[TK.:×(TK.U₁, TK.SU₂)]
+        product_source = residual_route_rank4_state()
+        FiniteMPS.canonicalize!(product_source, 1)
+        dual_q = TK.GradedSpace(
+            product_sector(0, 1) => 1,
+            product_sector(1, 1 // 2) => 1,
+        )'
+        for tangent in (
+            tangent_with_random_insertions(nonabelian_base),
+            tangent_with_persistent_symmetry(nonabelian_base, TK.Rep[TK.SU₂](1 => 1)),
+            tangent_with_persistent_symmetry(FiniteMPSTangents.BaseMPS(product_source), dual_q),
+        ), purified in (true, false)
+            sampler = BS.BornSampler(tangent; purified)
+            steps = BS._tangent_local_steps(sampler)
+            mode = purified ? BS.TracedTangentMode : BS.JointTangentMode
+            has_q = BS._tensor_rank(first(tangent.B)) == BS._tensor_rank(first(tangent.base.Al)) + 1
+            original_sector = TK.sectortype(first(tangent.B).A)
+            metric = BS._right_symmetric_tangent_completion(ComplexF64, tangent, mode)
+            for cut in length(steps):-1:0
+                dense = dense_tangent_suffix_grams(tangent, cut)
+                @test metric isa BS.SymmetricTangentCompletion
+                @test TK.sectortype(metric.inserted) === original_sector
+                @test TK.sectortype(metric.cross) === original_sector
+                @test TK.sectortype(metric.uninserted) === original_sector
+                @test TK.numind(metric.inserted) == 2
+                @test TK.numind(metric.cross) == (has_q ? 3 : 2)
+                @test TK.numind(metric.uninserted) == (has_q && !purified ? 4 : 2)
+                @test convert(Array, metric.inserted) ≈ transpose(dense.inserted) rtol=3e-11 atol=3e-13
+                expected_cross = has_q ? permutedims(dense.cross, (2, 3, 1)) :
+                                 transpose(dense.cross[:, :, 1])
+                @test convert(Array, metric.cross) ≈ expected_cross rtol=3e-11 atol=3e-13
+                expected_uninserted = if purified
+                    transpose(sum(dense.uninserted[:, :, q, q] for q in axes(dense.cross, 3)))
+                elseif has_q
+                    permutedims(dense.uninserted, (2, 3, 4, 1))
+                else
+                    transpose(dense.uninserted[:, :, 1, 1])
+                end
+                @test convert(Array, metric.uninserted) ≈ expected_uninserted rtol=3e-11 atol=3e-13
+                step = steps[max(cut, 1)]
+                side = cut == 0 ? :left : :right
+                converted = BS._residual_tangent_completion(metric, step, mode; side)
+                test_tangent_residual_completion(converted, dense, step.left; side, purified)
+                cut == 0 && continue
+                metric = BS._retreat_symmetric_tangent_completion(
+                    metric, tangent.base.Al[cut], tangent.base.Ar[cut], tangent.B[cut], mode,
+                )
+            end
+
+            for disk in (false, true)
+                run = BS._begin_sampling_run(sampler; disk)
+                try
+                    @test run.root_completion isa BS.TangentCompletionMetric
+                    pending = if disk
+                        [open(BS.deserialize, path) for path in readdir(run.store.directory; join=true)]
+                    else
+                        filter(!isnothing, run.store.values)
+                    end
+                    @test all(value -> value isa BS.TangentCompletionMetric, pending)
+                    for layer in eachindex(sampler.plans)
+                        @test BS._take_sampling_completion!(run, layer) isa BS.TangentCompletionMetric
+                    end
+                    @test all(isnothing, run.store.values)
+                    disk && @test isempty(readdir(run.store.directory))
+                finally
+                    BS._cleanup_sampling_run!(run)
+                end
             end
         end
     end

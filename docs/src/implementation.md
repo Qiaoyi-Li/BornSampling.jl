@@ -312,21 +312,25 @@ subsequent workers follow a lock-free path.
 ### Tangent suffix completions
 
 Before sampling a tangent batch, a right-to-left sweep builds suffix
-environments:
+environments in the original symmetry:
 
 ```math
 I=R^\dagger R,\qquad K_q=R^\dagger T_q,\qquad
-N_q=T_q^\dagger T_q.
+N_{q,q'}=T_q^\dagger T_{q'}.
 ```
 
-These matrices capture the tangent-vector inner products without expanding the
-full ``L \times L`` cross terms, scaling as ``\mathcal{O}(L Q D^3)`` once per
-batch rather than per shot. Each site completion is shared read-only across all
-worker tasks during the forward pass.
+Joint sampling retains both ``q`` legs of ``N`` during the sweep; traced sampling
+uses ``N_{\mathrm{tr}}=\sum_q N_{q,q}``. The sweep runs once per batch, with cost
+determined by the original symmetry's reduced blocks and fusion channels. Each
+completed suffix is converted to residual-sector matrices for storage, keeping
+only ``N_{q,q}`` in joint mode, while the next transfer uses the original-symmetry
+environment. Forward sampling starts after all completions are prepared and
+shares each site completion read-only across worker tasks.
 
-With `disk=false`, suffix completions are held in memory. With `disk=true`,
-completions are streamed from temporary files and deleted after consumption,
-keeping resident memory constant with respect to chain length.
+With `disk=false`, converted suffix completions are held in memory. With
+`disk=true`, they are written directly to temporary files and deleted after
+consumption, keeping resident suffix memory constant with respect to chain
+length. Neither mode stores a chain of original-symmetry environments.
 
 ## Probability-ranked environment storage
 
