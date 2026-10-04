@@ -50,7 +50,10 @@ function direct_szsz_by_distance(state; ntasks::Int)
             name=(:S, :S),
         )
     end
-    calObs!(observable_tree, state; normalize=true, ntasks=ntasks)
+    calObs!(observable_tree, state;
+        normalize=true,
+        alg=LayeredTreeEval(ntasks=ntasks),
+    )
     observables = convert(Dict, observable_tree)
 
     # Spin-rotation invariance gives SzSz = (S⋅S)/3.
@@ -190,7 +193,7 @@ function _optimize_ground_state!(environment; D, nsites)
         info, _ = DMRGSweep1!(
             environment;
             K=16,
-            trunc=truncdim(D) & truncbelow(1e-12),
+            trunc=truncrank(D) & trunctol(; atol=1e-12),
             CBEAlg=NaiveCBE(D + div(D, 4), 1e-8; rsvd=true),
             GCsweep=true,
         )
@@ -226,7 +229,7 @@ function prepare_thermal_factor(hamiltonian; D)
         hamiltonian,
         beta;
         CBEAlg=NaiveCBE(D + div(D, 4), 1e-8; rsvd=true),
-        trunc=truncdim(D) & truncbelow(1e-16),
+        trunc=truncrank(D) & trunctol(; atol=1e-16),
         maxorder=4,
         maxiter=6,
         tol=1e-12,
@@ -242,7 +245,7 @@ function prepare_thermal_factor(hamiltonian; D)
             environment,
             -delta_beta / 2;
             CBEAlg=NaiveCBE(D + div(D, 4), 1e-8; rsvd=true),
-            trunc=truncdim(D) & truncbelow(1e-12),
+            trunc=truncrank(D) & trunctol(; atol=1e-12),
             GCsweep=true,
         )
         normalize!(factor)
