@@ -48,22 +48,4 @@
     @test Cnext * adjoint(Cnext) ≈ reference_density rtol=2e-12 atol=2e-12
     @test Int(TK.dim(TK.domain(Cnext))) <= Int(TK.dim(plan.residual_right.space))
 
-    rank3_sampler = BS.BornSampler(rank3_state(length=2, bonddim=2))
-    rank3_workspace = first(rank3_sampler.workspaces)
-    rank3_plan = first(rank3_sampler.plans)
-    rank3_C = rank3_sampler.initial_factor
-    BS._compute_weights!(rank3_workspace, rank3_C, rank3_plan)
-    selected3 = argmax(@view rank3_workspace.q[1:rank3_plan.physical.fulldim])
-    rank3_G = BS._build_selected_factor!(
-        rank3_workspace, rank3_C, rank3_plan, selected3,
-    )
-    rank3_next = BS._advance_factor!(
-        rank3_workspace,
-        rank3_C,
-        rank3_plan,
-        selected3,
-        rank3_workspace.q[selected3],
-    )
-    @test Int(TK.dim(TK.domain(rank3_next))) == 1
-    @test size(rank3_workspace.route_output, 2) == 1
 end

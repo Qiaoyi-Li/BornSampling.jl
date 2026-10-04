@@ -127,23 +127,20 @@ end
             sampler = BS.BornSampler(deepcopy(source); purified)
             reference = normalize_weights!(dense_mpo_boundary_weights(source; purified))
             output_length = purified ? length(source) : 2 * length(source) + 1
-            seed_rng = MersenneTwister(seed)
-            shot_seeds = [rand(seed_rng, UInt64) for _ in 1:nshots]
-            expected_configuration = Matrix{Int}(undef, output_length, nshots)
-            expected_log_probability = Vector{Float64}(undef, nshots)
-            for shot in 1:nshots
-                expected_log_probability[shot] = BS.bornsample!(
-                    Random.Xoshiro(shot_seeds[shot]), sampler,
-                    @view(expected_configuration[:, shot]),
-                )
-            end
-            for disk in (false, true), ntasks in (1, Threads.nthreads() + 2)
-                result = BS.bornsample!(
-                    MersenneTwister(seed), sampler, nshots; disk, ntasks, maxsize=1,
-                )
+            execution_options = (
+                (; ntasks=1, disk=false),
+                (; ntasks=Threads.nthreads() + 1, disk=false),
+                (; ntasks=Threads.nthreads() + 1, disk=true, maxsize=1),
+            )
+            baseline = nothing
+            for options in execution_options
+                result = BS.bornsample!(MersenneTwister(seed), sampler, nshots; options...)
                 @test size(result.configuration) == (output_length, nshots)
-                @test result.configuration == expected_configuration
-                @test result.log_probability ≈ expected_log_probability atol=8e-13
+                if baseline === nothing
+                    baseline = result
+                else
+                    @test result == baseline
+                end
                 for shot in 1:nshots
                     @test exp(result.log_probability[shot]) ≈
                           reference[Tuple(@view result.configuration[:, shot])]

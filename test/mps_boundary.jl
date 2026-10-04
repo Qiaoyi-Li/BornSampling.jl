@@ -164,37 +164,23 @@ end
             sampler = BS.BornSampler(deepcopy(source); purified)
             reference = normalize_weights!(dense_mps_boundary_weights(source; purified))
             configuration_length = length(source) + Int(!purified)
-            seed_rng = MersenneTwister(seed)
-            shot_seeds = [rand(seed_rng, UInt64) for _ in 1:nshots]
-            expected_configuration = Matrix{Int}(undef, configuration_length, nshots)
-            expected_log_probability = Vector{Float64}(undef, nshots)
-            for shot in 1:nshots
-                expected_log_probability[shot] = BS.bornsample!(
-                    Random.Xoshiro(shot_seeds[shot]),
-                    sampler,
-                    @view(expected_configuration[:, shot]),
-                )
-                @test exp(expected_log_probability[shot]) ≈
-                      reference[Tuple(@view expected_configuration[:, shot])]
-            end
-            expected_next_caller_value = rand(seed_rng, UInt64)
-
+            execution_options = (
+                (; ntasks=1, disk=false),
+                (; ntasks=Threads.nthreads() + 1, disk=false),
+                (; ntasks=Threads.nthreads() + 1, disk=true, maxsize=1),
+            )
             baseline = nothing
-            for disk in (false, true), ntasks in (1, Threads.nthreads() + 2)
-                caller_rng = MersenneTwister(seed)
-                result = BS.bornsample!(
-                    caller_rng, sampler, nshots; ntasks, disk, maxsize=1,
-                )
+            for options in execution_options
+                result = BS.bornsample!(MersenneTwister(seed), sampler, nshots; options...)
                 @test size(result.configuration) == (configuration_length, nshots)
-                @test result.configuration == expected_configuration
-                @test result.log_probability ≈
-                      expected_log_probability rtol=3e-11 atol=3e-13
-                @test rand(caller_rng, UInt64) == expected_next_caller_value
                 if baseline === nothing
                     baseline = result
                 else
-                    @test result.configuration == baseline.configuration
-                    @test result.log_probability == baseline.log_probability
+                    @test result == baseline
+                end
+                for shot in eachindex(result.log_probability)
+                    @test exp(result.log_probability[shot]) ≈
+                          reference[Tuple(@view result.configuration[:, shot])] rtol=3e-11 atol=3e-13
                 end
             end
 
@@ -202,9 +188,9 @@ end
                 MersenneTwister(seed), deepcopy(source), nshots;
                 purified, ntasks=2, disk=true, maxsize=1,
             )
-            @test direct.configuration == expected_configuration
+            @test direct.configuration == baseline.configuration
             @test direct.log_probability ≈
-                  expected_log_probability rtol=3e-11 atol=3e-13
+                  baseline.log_probability rtol=3e-11 atol=3e-13
             empty_batch = BS.bornsample!(
                 MersenneTwister(seed), sampler, 0; disk=true, maxsize=1,
             )

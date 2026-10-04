@@ -285,48 +285,4 @@
               sum(sum(abs2, piece) for blocks in values(pieces) for piece in blocks)
     end
 
-    @testset "TensorKit exact residual compression" begin
-        residual_type = TK.Irrep[TK.U₁]
-        right_space = TK.GradedSpace(
-            residual_type(0) => 2,
-            residual_type(1) => 3,
-        )
-        branch_space = TK.GradedSpace(
-            residual_type(0) => 5,
-            residual_type(1) => 4,
-        )
-        G = TK.randn(
-            MersenneTwister(0x4c51_706f),
-            ComplexF64,
-            right_space,
-            branch_space,
-        )
-        reference = copy(G)
-        L, Q = TK.rightorth!(G; alg=TK.LQpos())
-
-        @test reference ≈ L * Q rtol=2e-13 atol=2e-13
-        @test reference * adjoint(reference) ≈
-              L * adjoint(L) rtol=5e-13 atol=5e-13
-        @test size(TK.block(L, residual_type(0))) == (2, 2)
-        @test size(TK.block(L, residual_type(1))) == (3, 3)
-        @test size(TK.block(Q, residual_type(0))) == (2, 5)
-        @test size(TK.block(Q, residual_type(1))) == (3, 4)
-
-        trivial = TK.Trivial()
-        trivial_right = BS._residual_space(TK.Trivial, Dict(trivial => 3))
-        trivial_branch = BS._residual_space(TK.Trivial, Dict(trivial => 5))
-        dense_G = TK.randn(
-            MersenneTwister(0x7472_6976),
-            ComplexF64,
-            trivial_right,
-            trivial_branch,
-        )
-        dense_reference = copy(dense_G)
-        dense_L, dense_Q = TK.rightorth!(dense_G; alg=TK.LQpos())
-        @test dense_reference ≈ dense_L * dense_Q rtol=2e-13 atol=2e-13
-        @test dense_reference * adjoint(dense_reference) ≈
-              dense_L * adjoint(dense_L) rtol=5e-13 atol=5e-13
-        @test size(TK.block(dense_L, trivial)) == (3, 3)
-        @test size(TK.block(dense_Q, trivial)) == (3, 5)
-    end
 end

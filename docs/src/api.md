@@ -74,8 +74,6 @@ batch = BornSampling.bornsample!(
     sampler,
     nshots;
     ntasks=Threads.nthreads(),
-    disk=false,
-    maxsize=ntasks,
 )
 ```
 

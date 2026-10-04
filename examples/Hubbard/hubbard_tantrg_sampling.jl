@@ -52,7 +52,7 @@ function thermal_factor(hamiltonian)
             1e-8;
             rsvd=true,
         ),
-        trunc=truncdim(D) & truncbelow(1e-16),
+        trunc=truncrank(D) & trunctol(; atol=1e-16),
         maxorder=4,
         maxiter=6,
         tol=1e-12,
@@ -74,7 +74,7 @@ function thermal_factor(hamiltonian)
                 1e-8;
                 rsvd=true,
             ),
-            trunc=truncdim(D) & truncbelow(1e-12),
+            trunc=truncrank(D) & trunctol(; atol=1e-12),
             GCsweep=true,
             verbose=1,
         )
@@ -268,7 +268,7 @@ function main()
         observable_tree,
         factor;
         normalize=true,
-        ntasks=SAMPLING_TASKS,
+        alg=LayeredTreeEval(ntasks=SAMPLING_TASKS),
     )
     exact_matrix = szsz_matrix(observable_tree, length(factor))
 

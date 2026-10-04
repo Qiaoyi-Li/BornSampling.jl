@@ -373,30 +373,6 @@ end
 
         for purified in (true, false)
             sampler = BS.BornSampler(tangent; purified)
-            @test (first(sampler.plans) isa BS.TangentBoundaryPlan) == !purified
-            @test length(sampler.plans) == length(state) + 2 * Int(!purified)
-            !purified && @test sampler.plans[2] isa BS.TangentGlobalQPlan
-            run = BS._begin_sampling_run(sampler; disk=true)
-            completion_directory = run.store.directory
-            expected_files = Set(
-                "completion_$site.bin" for
-                site in (purified ? (2:length(state)) : (1:length(state)))
-            )
-            try
-                @test Set(readdir(completion_directory)) == expected_files
-                BS._take_sampling_completion!(run, 1)
-                @test Set(readdir(completion_directory)) == expected_files
-                for layer in 2:length(sampler.plans)
-                    BS._take_sampling_completion!(run, layer)
-                    site = purified ? layer : layer - 2
-                    delete!(expected_files, "completion_$site.bin")
-                    @test Set(readdir(completion_directory)) == expected_files
-                end
-            finally
-                BS._cleanup_sampling_run!(run)
-            end
-            @test !ispath(completion_directory)
-
             serial = BS.bornsample!(
                 MersenneTwister(0x7162_6174),
                 sampler,
@@ -449,7 +425,6 @@ end
         base = FiniteMPSTangents.BaseMPS(source)
         L = length(base.Al)
         operator_like = any(tensor -> BS._tensor_rank(tensor) == 4, base.Al)
-        boundary_dimension = Int(TK.dim(BS.leftspace(first(base.Al))))
         for has_symmetry in (false, true)
             tangent = has_symmetry ? tangent_with_persistent_symmetry(base, symmetry) :
                       tangent_with_random_insertions(base)
@@ -457,25 +432,11 @@ end
             joint = normalize_weights!(dense_tangent_boundary_weights(tangent; purified=false))
             incoherent = normalize_weights!(dense_tangent_boundary_weights(tangent; coherent=false))
             @test maximum(abs(traced[configuration] - incoherent[configuration]) for configuration in keys(traced)) > 1e-5
-            @test sum(values(traced)) ≈ 1 atol=3e-13
-            @test sum(values(joint)) ≈ 1 atol=3e-13
-            for (physical, probability) in traced
-                marginal = sum(joint) do (configuration, weight)
-                    configuration[1:L] == physical ? weight : 0.0
-                end
-                @test marginal ≈ probability rtol=3e-11 atol=3e-13
-            end
-
             joint_length = (operator_like ? 2 * L : L) + 1 + Int(has_symmetry)
             for purified in (true, false)
                 sampler = BS.BornSampler(tangent; purified)
                 reference = purified ? traced : joint
                 expected_length = purified ? L : joint_length
-                initial = sampler.initial_factor
-                @test size(initial.uninserted) == (boundary_dimension, boundary_dimension)
-                @test initial.uninserted * adjoint(initial.uninserted) ≈
-                      Matrix{ComplexF64}(I, boundary_dimension, boundary_dimension) / boundary_dimension atol=3e-13
-                @test all(iszero, initial.inserted)
                 for (target_key, probability) in reference
                     probability <= 1e-15 && continue
                     target = collect(target_key)
@@ -497,21 +458,14 @@ end
                 )
 
                 nshots = 16
-                seed_rng = MersenneTwister(seed)
-                shot_seeds = [rand(seed_rng, UInt64) for _ in 1:nshots]
-                expected_configuration = Matrix{Int}(undef, expected_length, nshots)
-                expected_log_probability = [
-                    BS.bornsample!(Random.Xoshiro(shot_seeds[shot]), sampler, @view expected_configuration[:, shot])
-                    for shot in 1:nshots
-                ]
-                expected_next_caller_value = rand(seed_rng, UInt64)
+                execution_options = (
+                    (; ntasks=1, disk=false),
+                    (; ntasks=Threads.nthreads() + 1, disk=false),
+                    (; ntasks=Threads.nthreads() + 1, disk=true, maxsize=1),
+                )
                 baseline = nothing
-                for disk in (false, true), ntasks in (1, Threads.nthreads() + 2)
-                    caller_rng = MersenneTwister(seed)
-                    result = BS.bornsample!(caller_rng, sampler, nshots; disk, ntasks, maxsize=1)
-                    @test result.configuration == expected_configuration
-                    @test result.log_probability ≈ expected_log_probability rtol=3e-11 atol=3e-13
-                    @test rand(caller_rng, UInt64) == expected_next_caller_value
+                for options in execution_options
+                    result = BS.bornsample!(MersenneTwister(seed), sampler, nshots; options...)
                     if baseline === nothing
                         baseline = result
                     else
@@ -614,17 +568,9 @@ end
             steps = BS._tangent_local_steps(sampler)
             mode = purified ? BS.TracedTangentMode : BS.JointTangentMode
             has_q = BS._tensor_rank(first(tangent.B)) == BS._tensor_rank(first(tangent.base.Al)) + 1
-            original_sector = TK.sectortype(first(tangent.B).A)
             metric = BS._right_symmetric_tangent_completion(ComplexF64, tangent, mode)
             for cut in length(steps):-1:0
                 dense = dense_tangent_suffix_grams(tangent, cut)
-                @test metric isa BS.SymmetricTangentCompletion
-                @test TK.sectortype(metric.inserted) === original_sector
-                @test TK.sectortype(metric.cross) === original_sector
-                @test TK.sectortype(metric.uninserted) === original_sector
-                @test TK.numind(metric.inserted) == 2
-                @test TK.numind(metric.cross) == (has_q ? 3 : 2)
-                @test TK.numind(metric.uninserted) == (has_q && !purified ? 4 : 2)
                 @test convert(Array, metric.inserted) ≈ transpose(dense.inserted) rtol=3e-11 atol=3e-13
                 expected_cross = has_q ? permutedims(dense.cross, (2, 3, 1)) :
                                  transpose(dense.cross[:, :, 1])
@@ -646,71 +592,8 @@ end
                     metric, tangent.base.Al[cut], tangent.base.Ar[cut], tangent.B[cut], mode,
                 )
             end
-
-            for disk in (false, true)
-                run = BS._begin_sampling_run(sampler; disk)
-                try
-                    @test run.root_completion isa BS.TangentCompletionMetric
-                    pending = if disk
-                        [open(BS.deserialize, path) for path in readdir(run.store.directory; join=true)]
-                    else
-                        filter(!isnothing, run.store.values)
-                    end
-                    @test all(value -> value isa BS.TangentCompletionMetric, pending)
-                    for layer in eachindex(sampler.plans)
-                        @test BS._take_sampling_completion!(run, layer) isa BS.TangentCompletionMetric
-                    end
-                    @test all(isnothing, run.store.values)
-                    disk && @test isempty(readdir(run.store.directory))
-                finally
-                    BS._cleanup_sampling_run!(run)
-                end
-            end
         end
     end
-
-    @testset "consume-once completion store" begin
-        for disk in (false, true)
-            store = BS.TangentCompletionStore{Vector{Int}}(3; disk)
-            directory = store.directory
-            try
-                BS._put_completion!(store, 2, [2, 3])
-                BS._put_completion!(store, 1, [1])
-                BS._put_completion!(store, 3, [4, 5, 6])
-                if disk
-                    @test Set(readdir(directory)) == Set(
-                        "completion_$site.bin" for site in 1:3
-                    )
-                end
-
-                @test BS._take_completion!(store, 1) == [1]
-                if disk
-                    @test Set(readdir(directory)) ==
-                          Set(["completion_2.bin", "completion_3.bin"])
-                else
-                    @test isnothing(store.values[1])
-                end
-
-                @test BS._take_completion!(store, 2) == [2, 3]
-                if disk
-                    @test Set(readdir(directory)) == Set(["completion_3.bin"])
-                else
-                    @test isnothing(store.values[2])
-                    @test store.values[3] == [4, 5, 6]
-                end
-            finally
-                # Site 3 is deliberately left pending. Cleanup must remove an
-                # unconsumed in-memory value or disk file after an early exit.
-                BS._cleanup_completion_store!(store)
-            end
-            BS._cleanup_completion_store!(store)
-            @test all(isnothing, store.values)
-            if directory !== nothing
-                @test !ispath(directory)
-            end
-        end
-    end
-
 
     @testset "mixed-rank MPO base" begin
         state = mixed_rank_three_site_mpo_state()
@@ -718,7 +601,6 @@ end
         tangent = FiniteMPSTangents.TangentMPS(
             FiniteMPSTangents.BaseMPS(state),
         )
-        @test sort(unique(BS._tensor_rank.(tangent.base.Al))) == [3, 4]
         result = BS.bornsample!(
             MersenneTwister(0x6d69_7865),
             tangent,

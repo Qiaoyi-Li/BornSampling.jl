@@ -48,7 +48,7 @@ end
 function product_su2_spaces()
     physical = FiniteMPS.U1SU2Fermion.pspace
     sector_type = TK.sectortype(physical)
-    vacuum = one(sector_type)
+    vacuum = TK.unit(sector_type)
     virtual = TK.GradedSpace(vacuum => 1, sector_type((0, 1)) => 1)
     boundary = TK.GradedSpace(vacuum => 1)
     return (; physical, virtual, boundary)
@@ -140,7 +140,7 @@ function residual_route_rank4_state(; T=ComplexF64, seed=41)
         sector_type(0, 1 // 2) => 1,
         sector_type(1, 0) => 1,
     )
-    boundary = TK.GradedSpace(one(sector_type) => 1)
+    boundary = TK.GradedSpace(TK.unit(sector_type) => 1)
     virtual = TK.GradedSpace(
         sector_type(0, 0) => 1,
         sector_type(0, 1) => 1,
@@ -228,7 +228,18 @@ end
 function rank3_state(; T=ComplexF64, length=3, bonddim=3)
     physical = FiniteMPS.NoSymSpinOneHalf.pspace
     virtual = TK.ComplexSpace(bonddim)
-    return FiniteMPS.randMPS(T, length, physical, virtual)
+    boundary = TK.unitspace(physical)
+    tensors = [
+        FiniteMPS.MPSTensor(TK.randn(
+            T,
+            ⊗(site == 1 ? boundary : virtual, physical),
+            site == length ? boundary : virtual,
+        )) for site in 1:length
+    ]
+    state = FiniteMPS.MPS(tensors)
+    FiniteMPS.canonicalize!(state, length)
+    FiniteMPS.canonicalize!(state, 1)
+    return normalize!(state)
 end
 
 function rank4_state(; T=ComplexF64)
@@ -395,35 +406,6 @@ function dense_physical_weights(state; left_boundary=nothing)
     return weights
 end
 
-"Dense joint physical-purification probabilities in external `[x..., y...]` layout."
-function dense_joint_weights(state; left_boundary=nothing)
-    tensors = map(site -> convert(Array, site.A), state.A)
-    physical_dimensions = map(A -> size(A, 2), tensors)
-    purification_dimensions = map(A -> ndims(A) == 3 ? 1 : size(A, 3), tensors)
-    initial = left_boundary === nothing ?
-              ones(eltype(first(tensors)), size(first(tensors), 1)) :
-              Vector{eltype(first(tensors))}(left_boundary)
-    weights = Dict{Tuple{Vararg{Int}},Float64}()
-    for physical in all_configurations(physical_dimensions)
-        for purification in all_configurations(purification_dimensions)
-            factor = initial
-            for site in eachindex(tensors)
-                A = tensors[site]
-                factor = if ndims(A) == 3
-                    transpose(@view(A[:, physical[site], :])) * factor
-                else
-                    transpose(
-                        @view(A[:, physical[site], purification[site], :]),
-                    ) * factor
-                end
-            end
-            configuration = Tuple(vcat(physical, purification))
-            weights[configuration] = real(sum(abs2, factor))
-        end
-    end
-    return weights
-end
-
 "Dense MPS probabilities with the full left boundary traced or retained as `[x..., b]`."
 function dense_mps_boundary_weights(state; purified=true)
     tensors = map(site -> convert(Array, site.A), state.A)
@@ -532,42 +514,6 @@ function advance_test_factor!(
     )
 end
 
-"Evaluate the log of the sampler's sequential conditionals on a prescribed branch."
-function sequential_log_probability!(sampler, physical::AbstractVector{Int})
-    workspace = first(sampler.workspaces)
-    factor = sampler.initial_factor
-    log_probability = zero(eltype(workspace.q))
-    for (site, plan) in enumerate(sampler.plans)
-        physical_dimension = plan.physical.fulldim
-        BS._compute_weights!(workspace, factor, plan)
-        normalization = BS._total_weight(workspace.q, physical_dimension, site)
-        selected_weight = workspace.q[physical[site]]
-        iszero(selected_weight) && return oftype(log_probability, -Inf)
-        log_probability += log(selected_weight) - log(normalization)
-        factor = advance_test_factor!(
-            workspace,
-            factor,
-            plan,
-            physical[site],
-            selected_weight,
-        )
-        @test Int(TK.dim(TK.domain(factor))) <=
-              Int(TK.dim(plan.residual_right.space))
-    end
-    return log_probability
-end
-
-"A bond-one product state whose only nonzero physical configuration is all ones."
-function deterministic_rank3_state(; T=ComplexF64, length=4)
-    physical = FiniteMPS.NoSymSpinOneHalf.pspace
-    boundary = TK.ComplexSpace(1)
-    data = reshape(T[one(T), zero(T)], 1, 2, 1)
-    tensor = TK.TensorMap(data, ⊗(boundary, physical), boundary)
-    return FiniteMPS.MPS([
-        FiniteMPS.MPSTensor(copy(tensor)) for _ in 1:length
-    ])
-end
-
 mutable struct SequenceRNG <: Random.AbstractRNG
     values::Vector{Float64}
     index::Int
@@ -605,46 +551,6 @@ function uniforms_for_configuration(probabilities, target::AbstractVector{Int})
 end
 
 
-"Force `[x..., y...]` while the sampler draws one flattened `(x,y)` per site."
-function uniforms_for_joint_configuration(
-    probabilities,
-    target::AbstractVector{Int},
-    purification_dimensions::AbstractVector{Int},
-)
-    chain_length = length(purification_dimensions)
-    length(target) == 2 * chain_length || throw(DimensionMismatch(
-        "joint target length must be twice the chain length",
-    ))
-    uniforms = Float64[]
-    for site in 1:chain_length
-        purification_dimension = purification_dimensions[site]
-        target_outcome =
-            (target[site] - 1) * purification_dimension + target[chain_length + site]
-        prefix_mass = 0.0
-        lower_mass = 0.0
-        selected_mass = 0.0
-        for (configuration, probability) in probabilities
-            matches_prefix = all(1:(site - 1)) do previous
-                configuration[previous] == target[previous] &&
-                    configuration[chain_length + previous] ==
-                    target[chain_length + previous]
-            end
-            matches_prefix || continue
-            prefix_mass += probability
-            outcome = (configuration[site] - 1) * purification_dimension +
-                      configuration[chain_length + site]
-            if outcome < target_outcome
-                lower_mass += probability
-            elseif outcome == target_outcome
-                selected_mass += probability
-            end
-        end
-        selected_mass > 0 || error("cannot force a zero-probability joint branch")
-        push!(uniforms, (lower_mass + selected_mass / 2) / prefix_mass)
-    end
-    return uniforms
-end
-
 "Force `[x..., y..., q]` with absent y=0 while drawing q, then one local `(x,y)` per site."
 function uniforms_for_mpo_boundary_configuration(probabilities, target, state)
     layout = mpo_joint_layout(state)
@@ -669,75 +575,4 @@ function uniforms_for_mpo_boundary_configuration(probabilities, target, state)
         for (configuration, probability) in probabilities
     )
     return uniforms_for_configuration(ordered_reference, draw_order(target))
-end
-
-
-"""
-An array wrapper that counts the reduced-block views taken by a compiled
-contraction plan. `_apply_route!` takes exactly one such view for every
-transition application, while route discovery and factor-space bookkeeping do
-not touch the wrapped data. This lets performance-structure tests detect a
-second selected-branch contraction without adding instrumentation to the
-library.
-"""
-struct ViewCountingArray{T,N,A} <: AbstractArray{T,N}
-    parent::A
-    views::Base.RefValue{Int}
-end
-
-ViewCountingArray(parent::A, views::Base.RefValue{Int}) where {A} =
-    ViewCountingArray{eltype(A),ndims(A),A}(parent, views)
-
-Base.size(array::ViewCountingArray) = size(array.parent)
-Base.axes(array::ViewCountingArray) = axes(array.parent)
-Base.IndexStyle(::Type{<:ViewCountingArray{T,N,A}}) where {T,N,A} =
-    Base.IndexStyle(A)
-Base.getindex(array::ViewCountingArray, indices...) =
-    getindex(array.parent, indices...)
-
-function Base.view(array::ViewCountingArray, indices...)
-    array.views[] += 1
-    return view(array.parent, indices...)
-end
-
-"Return `plan` with every reduced transition block instrumented for views."
-function view_counting_plan(
-    plan::BS.SitePlan{R,S},
-    views::Base.RefValue{Int},
-) where {R,S}
-    transitions = map(plan.transitions) do transition
-        BS.Transition{R,S}(
-            transition.left_slot,
-            transition.right_slot,
-            ViewCountingArray(transition.B, views),
-            transition.kernel,
-        )
-    end
-    return BS.SitePlan{R,S}(
-        plan.left,
-        plan.physical,
-        plan.purification,
-        plan.right,
-        plan.residual_left,
-        plan.residual_right,
-        plan.physical_basis,
-        plan.purification_basis,
-        transitions,
-        plan.routes,
-    )
-end
-
-"Count transition contractions needed to construct every local `(x,y)` branch."
-function all_branch_transition_count(plan, factor)
-    count = 0
-    for physical in plan.physical_basis
-        for purification in plan.purification_basis
-            for route in BS._channel_routes(plan, physical, purification)
-                left_sector = plan.residual_left.sectors[route.left_slot]
-                TK.hasblock(factor, left_sector) || continue
-                count += length(route.transition_indices)
-            end
-        end
-    end
-    return count
 end

@@ -466,7 +466,7 @@ function _compile_transitions(
     right,
     kernel_cache,
 ) where {R,S}
-    tree_pairs = TK.fusiontrees(A)
+    tree_pairs = collect(TK.fusiontrees(A))
     isempty(tree_pairs) && throw(ArgumentError("local tensor has no allowed fusion-tree blocks"))
 
     first_transition = _compile_transition(
@@ -643,8 +643,6 @@ end
 
 # In the supported ordinary finite-dimensional UniqueFusion representations,
 # every irrep carrier is one-dimensional and the canonical fusion scalar is one.
-# TensorKit 0.14 does not define `convert(Array, pair)` for its NoSym `Trivial`
-# fusion trees, so this path must not request an explicit fusion tensor.
 _kernel_cache(::Type{UniqueStyle}) = nothing
 _kernel_cache(::Type{FusionTreeStyle}) = Dict{Any,Any}()
 

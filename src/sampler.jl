@@ -615,7 +615,7 @@ function _compress_factor!(G, plan)
         end
     end
     if needs_compression
-        L, _ = TK.rightorth!(G; alg=TK.LQpos())
+        L, _ = TK.right_orth!(G; positive=true)
         return L
     end
     return G

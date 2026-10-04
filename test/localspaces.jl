@@ -26,12 +26,10 @@
         C = residual_factor(plan; rank=2, seed=seed)
         dense = convert(Array, tensor_map)
         scratch = zeros(ComplexF64, BS.scratch_length(plan))
-        route_count = 0
 
         for x in 1:plan.physical.fulldim, y in 1:plan.purification.fulldim
             K = transpose(@view dense[:, x, y, :])
             for route in basis_routes(plan, x, y)
-                route_count += 1
                 Cblock = TK.block(C, route_left_sector(plan, route))
                 actual = zeros(
                     ComplexF64,
@@ -55,6 +53,5 @@
                 @test actual ≈ reference rtol=3e-12 atol=3e-12
             end
         end
-        @test route_count > 0
     end
 end

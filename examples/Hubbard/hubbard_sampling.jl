@@ -82,7 +82,7 @@ function optimize_ground_state!(state, hamiltonian)
         info, _ = DMRGSweep1!(
             environment;
             K=16,
-            trunc=truncdim(D) & truncbelow(1e-12),
+            trunc=truncrank(D) & trunctol(; atol=1e-12),
             CBEAlg=NaiveCBE(
                 D + div(D, 4),
                 1e-8;
@@ -124,7 +124,7 @@ function exact_szsz(state, ntasks::Int)
         tree,
         state;
         normalize=true,
-        ntasks=ntasks,
+        alg=LayeredTreeEval(ntasks=ntasks),
     )
     observables = convert(Dict, tree)
 
